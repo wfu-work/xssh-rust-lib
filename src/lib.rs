@@ -12,7 +12,7 @@ pub mod terminal;
 pub mod sftp;
 
 pub use core::{
-    Algorithm, AuthMethod, ErrorKind, HashAlg, HostKeyDecision, HostKeyVerifier,
-    KnownHostKeyVerifier, PrivateKey, PublicKey, SecretString, SshChannel, SshChannelEvent,
-    SshChannelStream, SshConfig, SshError, SshSession,
+    Algorithm, AuthMethod, CancellationToken, ErrorContext, ErrorKind, HashAlg, HostKeyDecision,
+    HostKeyVerifier, KnownHostKeyVerifier, OperationContext, PrivateKey, PublicKey, SecretString,
+    SshChannel, SshChannelEvent, SshChannelStream, SshConfig, SshError, SshSession,
 };

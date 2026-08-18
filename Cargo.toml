@@ -1,6 +1,6 @@
 [package]
 name = "xssh-rust-lib"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "MIT"
 description = "Pure Rust SSH core, terminal, and SFTP library"
@@ -11,7 +11,7 @@ categories = ["network-programming", "authentication", "filesystem"]
 
 [dependencies]
 russh = { version = "=0.54.3", default-features = false, features = ["ring"] }
-tokio = { version = "1", features = ["net", "rt", "time"] }
+tokio = { version = "1", features = ["macros", "net", "rt", "sync", "time"] }
 zeroize = "1.8.1"
 russh-sftp = { version = "=2.1.0", optional = true }
 

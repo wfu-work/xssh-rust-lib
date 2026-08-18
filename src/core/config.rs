@@ -9,6 +9,8 @@ pub struct SshConfig {
     pub port: u16,
     pub username: String,
     pub connect_timeout: Duration,
+    pub authentication_timeout: Duration,
+    pub operation_timeout: Duration,
     pub keepalive_interval: Option<Duration>,
 }
 
@@ -19,6 +21,8 @@ impl SshConfig {
             port: 22,
             username: username.into(),
             connect_timeout: Duration::from_secs(15),
+            authentication_timeout: Duration::from_secs(15),
+            operation_timeout: Duration::from_secs(30),
             keepalive_interval: Some(Duration::from_secs(30)),
         };
         config.validate()?;
@@ -40,6 +44,16 @@ impl SshConfig {
         if self.connect_timeout.is_zero() {
             return Err(SshError::configuration(
                 "SSH connect timeout must be positive",
+            ));
+        }
+        if self.authentication_timeout.is_zero() {
+            return Err(SshError::configuration(
+                "SSH authentication timeout must be positive",
+            ));
+        }
+        if self.operation_timeout.is_zero() {
+            return Err(SshError::configuration(
+                "SSH operation timeout must be positive",
             ));
         }
         if self
@@ -73,6 +87,8 @@ mod tests {
         let config = SshConfig::new("example.com", "alice").unwrap();
         assert_eq!(config.port, 22);
         assert_eq!(config.connect_timeout, Duration::from_secs(15));
+        assert_eq!(config.authentication_timeout, Duration::from_secs(15));
+        assert_eq!(config.operation_timeout, Duration::from_secs(30));
         assert_eq!(config.keepalive_interval, Some(Duration::from_secs(30)));
     }
 

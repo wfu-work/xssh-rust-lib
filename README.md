@@ -16,11 +16,12 @@ xssh-rust-lib
 
 ### `core`
 
-- SSH TCP 连接、握手超时和 keepalive；
+- SSH TCP 连接、握手超时、认证超时、操作超时和 keepalive；
 - 密码与私钥认证；
 - 服务器主机密钥指纹校验；
 - 连接生命周期；
-- 通用 SSH session channel 和异步字节流。
+- 通用 SSH session channel 和异步字节流；
+- 可复用的 `CancellationToken`、`OperationContext` 和结构化 `SshError`。
 
 ### `terminal`
 
@@ -46,21 +47,60 @@ xssh-rust-lib
 
 ```toml
 [dependencies]
-xssh-rust-lib = "0.2"
+xssh-rust-lib = "0.3"
 ```
 
 如果只需要 SSH core，可以关闭默认功能：
 
 ```toml
 [dependencies]
-xssh-rust-lib = { version = "0.2", default-features = false }
+xssh-rust-lib = { version = "0.3", default-features = false }
 ```
 
 也可以按需启用：
 
 ```toml
-xssh-rust-lib = { version = "0.2", default-features = false, features = ["terminal"] }
+xssh-rust-lib = { version = "0.3", default-features = false, features = ["terminal"] }
 ```
+
+## 超时、截止时间与取消
+
+`SshConfig` 默认分别为连接/握手 15 秒、认证 15 秒、普通操作 30 秒。旧的异步方法会自动使用这些默认值：
+
+```rust,no_run
+let mut config = SshConfig::new("server.example.com", "alice")?;
+config.connect_timeout = std::time::Duration::from_secs(10);
+config.authentication_timeout = std::time::Duration::from_secs(15);
+config.operation_timeout = std::time::Duration::from_secs(30);
+```
+
+需要由 GPUI 任务或上层工作流取消单个连接/终端/SFTP 操作时，传入独立的 `OperationContext`。截止时间和取消信号同时生效，先触发的条件会返回 `ErrorKind::Timeout` 或 `ErrorKind::Cancelled`：
+
+```rust,no_run
+use std::time::Duration;
+use xssh_rust_lib::{CancellationToken, OperationContext};
+
+let cancellation = CancellationToken::new();
+let context = OperationContext::with_timeout(Duration::from_secs(20))
+    .with_cancellation(cancellation.clone());
+
+let session = xssh_rust_lib::SshSession::connect_with_context(
+    config,
+    verifier,
+    auth,
+    context.clone(),
+).await?;
+
+// 取消当前工作流时调用；不会自动关闭整个 SSH session。
+cancellation.cancel();
+```
+
+`SshSession::open_session_channel_with_context`、`TerminalSession::open_with_context`、
+`SftpClient::connect_with_context` 以及各模块的 `*_with_context` 方法可用于覆盖单次操作的 context。
+等待终端/channel 事件时，推荐使用返回 `Result` 的 `next_event_with_context`，这样可以区分正常关闭、超时和取消；
+`SshChannelStream` 也提供 `read_with_context`、`write_with_context` 和 `flush_with_context`。
+
+`SshError` 会保留错误源（如果底层库提供）、错误阶段、operation、host/port、远程 path 和 `is_retryable()` 标记；这些字段不包含密码或私钥内容，适合交给 GPUI 的状态层和日志层。
 
 ## 使用示例
 

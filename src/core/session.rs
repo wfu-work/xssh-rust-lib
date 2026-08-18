@@ -4,7 +4,7 @@ use russh::client::{self, Handler};
 use russh::keys::{PrivateKeyWithHashAlg, PublicKey};
 use russh::Disconnect;
 
-use crate::{AuthMethod, HostKeyDecision, HostKeyVerifier, SshConfig, SshError};
+use crate::{AuthMethod, HostKeyDecision, HostKeyVerifier, OperationContext, SshConfig, SshError};
 
 struct ClientHandler {
     host: String,
@@ -42,6 +42,7 @@ impl Handler for ClientHandler {
 pub struct SshSession {
     handle: client::Handle<ClientHandler>,
     config: SshConfig,
+    operation_context: OperationContext,
 }
 
 impl SshSession {
@@ -54,10 +55,25 @@ impl SshSession {
     where
         V: HostKeyVerifier + 'static,
     {
+        Self::connect_with_context(config, verifier, auth, OperationContext::new()).await
+    }
+
+    /// Connect with an explicit cancellation token or parent deadline.
+    pub async fn connect_with_context<V>(
+        config: SshConfig,
+        verifier: V,
+        auth: AuthMethod,
+        context: OperationContext,
+    ) -> Result<Self, SshError>
+    where
+        V: HostKeyVerifier + 'static,
+    {
         config.validate()?;
+        let host = config.host.clone();
+        let port = config.port;
         let handler = ClientHandler {
-            host: config.host.clone(),
-            port: config.port,
+            host: host.clone(),
+            port,
             verifier: Arc::new(verifier),
         };
         let client_config = client::Config {
@@ -67,17 +83,34 @@ impl SshSession {
         };
 
         let address = config.socket_address();
-        let mut handle = tokio::time::timeout(
-            config.connect_timeout,
-            client::connect(Arc::new(client_config), address, handler),
-        )
-        .await
-        .map_err(|_| SshError::timeout("SSH connection or handshake timed out"))?
-        .map_err(classify_connect_error)?;
+        let connect_context = context
+            .clone()
+            .with_timeout_from_now(config.connect_timeout);
+        let mut handle = connect_context
+            .run("ssh connect and handshake", async move {
+                client::connect(Arc::new(client_config), address, handler)
+                    .await
+                    .map_err(classify_connect_error)
+            })
+            .await
+            .map_err(|error| error.with_endpoint(host.clone(), port))?;
 
-        authenticate(&mut handle, &config.username, auth).await?;
+        let authentication_context = context
+            .clone()
+            .with_timeout_from_now(config.authentication_timeout);
+        authentication_context
+            .run(
+                "ssh authentication",
+                authenticate(&mut handle, &config.username, auth),
+            )
+            .await
+            .map_err(|error| error.with_endpoint(host, port))?;
 
-        Ok(Self { handle, config })
+        Ok(Self {
+            handle,
+            operation_context: context,
+            config,
+        })
     }
 
     pub fn is_closed(&self) -> bool {
@@ -88,20 +121,52 @@ impl SshSession {
         &self.config
     }
 
-    pub(crate) async fn open_raw_session_channel(
+    pub fn operation_context(&self) -> OperationContext {
+        self.operation_context
+            .clone()
+            .with_timeout_from_now(self.config.operation_timeout)
+    }
+
+    pub(crate) fn base_context(&self) -> OperationContext {
+        self.operation_context.clone()
+    }
+
+    pub(crate) async fn open_raw_session_channel_with_context(
         &self,
+        context: &OperationContext,
     ) -> Result<russh::Channel<russh::client::Msg>, SshError> {
-        self.handle
-            .channel_open_session()
+        context
+            .run_with_timeout(
+                "open SSH session channel",
+                self.config.operation_timeout,
+                async {
+                    self.handle.channel_open_session().await.map_err(|error| {
+                        SshError::from_source(crate::ErrorKind::Channel, error.to_string(), error)
+                    })
+                },
+            )
             .await
-            .map_err(|error| SshError::channel(error.to_string()))
     }
 
     pub async fn disconnect(&self) -> Result<(), SshError> {
-        self.handle
-            .disconnect(Disconnect::ByApplication, "client closed session", "")
+        let context = self.operation_context();
+        self.disconnect_with_context(&context).await
+    }
+
+    pub async fn disconnect_with_context(
+        &self,
+        context: &OperationContext,
+    ) -> Result<(), SshError> {
+        context
+            .run("disconnect SSH session", async {
+                self.handle
+                    .disconnect(Disconnect::ByApplication, "client closed session", "")
+                    .await
+                    .map_err(|error| {
+                        SshError::from_source(crate::ErrorKind::Channel, error.to_string(), error)
+                    })
+            })
             .await
-            .map_err(|error| SshError::channel(error.to_string()))
     }
 }
 
@@ -114,7 +179,9 @@ async fn authenticate(
         AuthMethod::Password(password) => handle
             .authenticate_password(username, password.as_str().to_owned())
             .await
-            .map_err(|error| SshError::authentication(error.to_string()))?,
+            .map_err(|error| {
+                SshError::from_source(crate::ErrorKind::Authentication, error.to_string(), error)
+            })?,
         AuthMethod::PrivateKey { key, passphrase } => {
             let key = if key.is_encrypted() {
                 let Some(passphrase) = passphrase else {
@@ -131,7 +198,13 @@ async fn authenticate(
             handle
                 .authenticate_publickey(username, PrivateKeyWithHashAlg::new(Arc::new(key), None))
                 .await
-                .map_err(|error| SshError::authentication(error.to_string()))?
+                .map_err(|error| {
+                    SshError::from_source(
+                        crate::ErrorKind::Authentication,
+                        error.to_string(),
+                        error,
+                    )
+                })?
         }
     };
 
@@ -151,9 +224,9 @@ fn classify_connect_error(error: SshError) -> SshError {
             .contains("key exchange")
             || error.message().to_ascii_lowercase().contains("ssh id") =>
         {
-            SshError::handshake(error.message().to_owned())
+            error.reclassify(crate::ErrorKind::Handshake)
         }
-        _ => SshError::connection(error.message().to_owned()),
+        _ => error.reclassify(crate::ErrorKind::Connection),
     }
 }
 
@@ -187,6 +260,21 @@ mod tests {
         }
     }
 
+    struct SlowPasswordServer;
+
+    impl server::Handler for SlowPasswordServer {
+        type Error = russh::Error;
+
+        async fn auth_password(
+            &mut self,
+            _user: &str,
+            _password: &str,
+        ) -> Result<Auth, Self::Error> {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Ok(Auth::Accept)
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn connects_verifies_host_key_and_authenticates() {
         let server_key = PrivateKey::random(
@@ -217,6 +305,46 @@ mod tests {
             .await
             .unwrap();
         assert!(!session.is_closed());
+        let first_deadline = session.operation_context().deadline().unwrap();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let second_deadline = session.operation_context().deadline().unwrap();
+        assert!(second_deadline > first_deadline);
         session.disconnect().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn authentication_honors_its_own_timeout() {
+        let server_key = PrivateKey::random(
+            &mut russh::keys::ssh_key::rand_core::OsRng,
+            Algorithm::Ed25519,
+        )
+        .unwrap();
+        let mut server_config = server::Config::default();
+        server_config.keys.push(server_key.clone());
+        let server_config = Arc::new(server_config);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            server::run_stream(server_config, socket, SlowPasswordServer)
+                .await
+                .unwrap();
+        });
+
+        let mut verifier = KnownHostKeyVerifier::new();
+        verifier.insert_key("127.0.0.1", address.port(), server_key.public_key());
+        let mut config = SshConfig::new("127.0.0.1", "alice").unwrap();
+        config.port = address.port();
+        config.connect_timeout = Duration::from_secs(5);
+        config.authentication_timeout = Duration::from_millis(10);
+
+        let error =
+            match SshSession::connect(config, verifier, AuthMethod::password("password")).await {
+                Ok(_) => panic!("authentication unexpectedly succeeded"),
+                Err(error) => error,
+            };
+        assert_eq!(error.kind(), crate::ErrorKind::Timeout);
+        assert_eq!(error.operation(), Some("ssh authentication"));
     }
 }
