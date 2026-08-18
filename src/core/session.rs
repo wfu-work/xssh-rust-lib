@@ -193,6 +193,31 @@ impl SshSession {
             })
             .await
     }
+
+    pub(crate) async fn open_raw_direct_tcpip_with_context(
+        &self,
+        target_host: String,
+        target_port: u16,
+        originator_address: String,
+        originator_port: u16,
+        context: &OperationContext,
+    ) -> Result<russh::Channel<russh::client::Msg>, SshError> {
+        context
+            .run("open direct-tcpip channel", async {
+                self.handle
+                    .channel_open_direct_tcpip(
+                        target_host,
+                        u32::from(target_port),
+                        originator_address,
+                        u32::from(originator_port),
+                    )
+                    .await
+                    .map_err(|error| {
+                        SshError::from_source(crate::ErrorKind::Channel, error.to_string(), error)
+                    })
+            })
+            .await
+    }
 }
 
 async fn authenticate(
@@ -553,6 +578,7 @@ mod tests {
     use russh::keys::ssh_key::certificate::Builder as CertificateBuilder;
     use russh::keys::{Algorithm, PrivateKey, PublicKey};
     use russh::server::{self, Auth, Response};
+    use russh::{ChannelMsg, CryptoVec};
     use tokio::net::TcpListener;
 
     use super::{ClientHandler, SshSession};
@@ -605,6 +631,60 @@ Vv9WFaQHofuFcUUAAAAaeHNzaC1ydXN0LWxpYiB0ZXN0IGZpeHR1cmUB
             } else {
                 Ok(Auth::reject())
             }
+        }
+    }
+
+    struct DirectTcpipServer;
+
+    impl server::Handler for DirectTcpipServer {
+        type Error = russh::Error;
+
+        async fn auth_password(
+            &mut self,
+            _user: &str,
+            password: &str,
+        ) -> Result<Auth, Self::Error> {
+            if password == "test-password" {
+                Ok(Auth::Accept)
+            } else {
+                Ok(Auth::reject())
+            }
+        }
+
+        async fn channel_open_direct_tcpip(
+            &mut self,
+            mut channel: russh::Channel<russh::server::Msg>,
+            host_to_connect: &str,
+            port_to_connect: u32,
+            _originator_address: &str,
+            _originator_port: u32,
+            session: &mut server::Session,
+        ) -> Result<bool, Self::Error> {
+            if host_to_connect != "echo.internal" || port_to_connect != 7 {
+                return Ok(false);
+            }
+
+            let channel_id = channel.id();
+            let handle = session.handle();
+            tokio::spawn(async move {
+                while let Some(message) = channel.wait().await {
+                    match message {
+                        ChannelMsg::Data { data } => {
+                            let _ = handle
+                                .data(channel_id, CryptoVec::from(data.to_vec()))
+                                .await;
+                        }
+                        ChannelMsg::Eof => {
+                            let _ = handle.eof(channel_id).await;
+                            let _ = handle.close(channel_id).await;
+                            break;
+                        }
+                        ChannelMsg::Close => break,
+                        _ => {}
+                    }
+                }
+            });
+            Ok(true)
         }
     }
 
@@ -732,6 +812,44 @@ Vv9WFaQHofuFcUUAAAAaeHNzaC1ydXN0LWxpYiB0ZXN0IGZpeHR1cmUB
         tokio::time::sleep(Duration::from_millis(1)).await;
         let second_deadline = session.operation_context().deadline().unwrap();
         assert!(second_deadline > first_deadline);
+        session.disconnect().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn direct_tcpip_channel_round_trips_data() {
+        let server_key = PrivateKey::random(
+            &mut russh::keys::ssh_key::rand_core::OsRng,
+            Algorithm::Ed25519,
+        )
+        .unwrap();
+        let mut server_config = server::Config::default();
+        server_config.keys.push(server_key.clone());
+        let server_config = Arc::new(server_config);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            server::run_stream(server_config, socket, DirectTcpipServer)
+                .await
+                .unwrap();
+        });
+
+        let mut verifier = KnownHostKeyVerifier::new();
+        verifier.insert_key("127.0.0.1", address.port(), server_key.public_key());
+        let mut config = SshConfig::new("127.0.0.1", "alice").unwrap();
+        config.port = address.port();
+        config.connect_timeout = Duration::from_secs(5);
+
+        let session = SshSession::connect(config, verifier, AuthMethod::password("test-password"))
+            .await
+            .unwrap();
+        let channel = session.open_direct_tcpip("echo.internal", 7).await.unwrap();
+        let mut stream = channel.into_stream();
+        stream.write(b"hello through ssh\n").await.unwrap();
+        let mut buffer = [0_u8; 18];
+        let read = stream.read(&mut buffer).await.unwrap();
+        assert_eq!(&buffer[..read], b"hello through ssh\n");
         session.disconnect().await.unwrap();
     }
 

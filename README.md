@@ -20,7 +20,7 @@ xssh-rust-lib
 - 密码、私钥、键盘交互、SSH agent 和 OpenSSH 用户证书认证；
 - 服务器主机密钥指纹校验；
 - 连接生命周期；
-- 通用 SSH session channel 和异步字节流；
+- 通用 SSH session channel、direct-tcpip 端口转发和异步字节流；
 - 可复用的 `CancellationToken`、`OperationContext` 和结构化 `SshError`。
 
 ### `terminal`
@@ -230,6 +230,36 @@ domain socket；Windows 默认连接 Pageant，或把 named pipe 路径传给同
 服务端剩余方法、partial-success 状态和脱敏错误信息。它适合在 GPUI 状态层展示下一步动作，
 不需要解析错误字符串；密码、OTP 和 passphrase 不会出现在 `Debug` 或标准认证错误文本中。
 
+## Direct TCP/IP 转发
+
+`SshSession::open_direct_tcpip` 打开一个由 SSH 服务端发起的 `direct-tcpip` channel，
+目标主机和端口由服务端解析。返回的 `SshChannel` 可以转换为支持
+`AsyncRead`/`AsyncWrite` 的 `SshChannelStream`，适合与本地监听 socket 做双向 relay：
+
+```rust,no_run
+use tokio::io::copy_bidirectional;
+use tokio::net::TcpListener;
+use xssh_rust_lib::SshSession;
+
+# async fn run(session: &SshSession) -> Result<(), Box<dyn std::error::Error>> {
+let listener = TcpListener::bind("127.0.0.1:15432").await?;
+loop {
+    let (mut local, _) = listener.accept().await?;
+    let channel = session.open_direct_tcpip("database.internal", 5432).await?;
+    let mut remote = channel.into_stream();
+    tokio::spawn(async move {
+        let _ = copy_bidirectional(&mut local, &mut remote).await;
+    });
+}
+# }
+```
+
+目标主机不能为空，目标端口必须大于零；参数错误会返回 `ErrorKind::Configuration`。
+默认 originator 是 `127.0.0.1:0`，需要传递真实来源时使用
+`open_direct_tcpip_from` 或其 `_with_context` 版本。打开 channel 支持
+`OperationContext` 的截止时间和取消信号，channel stream 的 `read`、`write`、`flush`
+也会沿用同一套操作超时策略。
+
 ## 使用示例
 
 ```rust,no_run
@@ -287,7 +317,7 @@ sftp.close().await?;
 
 ## 当前未包含
 
-GPUI UI、VT100 渲染、SQLite、Keychain、Windows Credential Manager、端口转发和代理链不属于当前基础库。
+GPUI UI、VT100 渲染、SQLite、Keychain、Windows Credential Manager、远程反向转发和代理链不属于当前基础库。
 
 ## 开发检查
 

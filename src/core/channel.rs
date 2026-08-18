@@ -39,6 +39,100 @@ pub struct SshChannel {
 }
 
 impl SshSession {
+    /// Open a direct TCP/IP channel to a host reachable by the SSH server.
+    ///
+    /// The returned channel carries raw bidirectional TCP bytes. The
+    /// originator is reported as `127.0.0.1:0`; use
+    /// [`SshSession::open_direct_tcpip_from_with_context`] when the server
+    /// needs the actual local originator address.
+    pub async fn open_direct_tcpip(
+        &self,
+        target_host: impl Into<String>,
+        target_port: u16,
+    ) -> Result<SshChannel, SshError> {
+        let context = self
+            .base_context()
+            .with_timeout_from_now(self.config().operation_timeout);
+        self.open_direct_tcpip_from_with_context(target_host, target_port, "127.0.0.1", 0, &context)
+            .await
+    }
+
+    /// Open a direct TCP/IP channel with an explicit operation context.
+    pub async fn open_direct_tcpip_with_context(
+        &self,
+        target_host: impl Into<String>,
+        target_port: u16,
+        context: &OperationContext,
+    ) -> Result<SshChannel, SshError> {
+        self.open_direct_tcpip_from_with_context(target_host, target_port, "127.0.0.1", 0, context)
+            .await
+    }
+
+    /// Open a direct TCP/IP channel and provide its originator address.
+    pub async fn open_direct_tcpip_from(
+        &self,
+        target_host: impl Into<String>,
+        target_port: u16,
+        originator_address: impl Into<String>,
+        originator_port: u16,
+    ) -> Result<SshChannel, SshError> {
+        let context = self
+            .base_context()
+            .with_timeout_from_now(self.config().operation_timeout);
+        self.open_direct_tcpip_from_with_context(
+            target_host,
+            target_port,
+            originator_address,
+            originator_port,
+            &context,
+        )
+        .await
+    }
+
+    /// Open a direct TCP/IP channel with explicit originator and context.
+    pub async fn open_direct_tcpip_from_with_context(
+        &self,
+        target_host: impl Into<String>,
+        target_port: u16,
+        originator_address: impl Into<String>,
+        originator_port: u16,
+        context: &OperationContext,
+    ) -> Result<SshChannel, SshError> {
+        let target_host = target_host.into();
+        let originator_address = originator_address.into();
+        if target_host.trim().is_empty() {
+            return Err(SshError::configuration(
+                "direct-tcpip target host must not be empty",
+            ));
+        }
+        if target_port == 0 {
+            return Err(SshError::configuration(
+                "direct-tcpip target port must be greater than zero",
+            ));
+        }
+        if originator_address.trim().is_empty() {
+            return Err(SshError::configuration(
+                "direct-tcpip originator address must not be empty",
+            ));
+        }
+
+        let channel = self
+            .open_raw_direct_tcpip_with_context(
+                target_host,
+                target_port,
+                originator_address,
+                originator_port,
+                context,
+            )
+            .await?;
+
+        Ok(SshChannel::from_inner(
+            channel,
+            context.clone(),
+            self.config().operation_timeout,
+        ))
+    }
+
     /// Open a generic SSH session channel after authentication.
     pub async fn open_session_channel(&self) -> Result<SshChannel, SshError> {
         self.open_session_channel_with_context(self.base_context())
@@ -52,15 +146,23 @@ impl SshSession {
     ) -> Result<SshChannel, SshError> {
         self.open_raw_session_channel_with_context(&context)
             .await
-            .map(|inner| SshChannel {
-                inner,
-                context,
-                operation_timeout: self.config().operation_timeout,
-            })
+            .map(|inner| SshChannel::from_inner(inner, context, self.config().operation_timeout))
     }
 }
 
 impl SshChannel {
+    pub(crate) fn from_inner(
+        inner: russh::Channel<russh::client::Msg>,
+        context: OperationContext,
+        operation_timeout: std::time::Duration,
+    ) -> Self {
+        Self {
+            inner,
+            context,
+            operation_timeout,
+        }
+    }
+
     /// Replace the default context used by operations on this channel.
     pub fn with_context(mut self, context: OperationContext) -> Self {
         self.context = context;
