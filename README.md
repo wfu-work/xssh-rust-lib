@@ -20,7 +20,7 @@ xssh-rust-lib
 - 密码、私钥、键盘交互、SSH agent 和 OpenSSH 用户证书认证；
 - 服务器主机密钥指纹校验；
 - 连接生命周期；
-- 通用 SSH session channel、direct-tcpip 端口转发和异步字节流；
+- 通用 SSH session channel、direct-tcpip/ProxyJump 端口转发和异步字节流；
 - 可复用的 `CancellationToken`、`OperationContext` 和结构化 `SshError`。
 
 ### `terminal`
@@ -342,6 +342,35 @@ println!("SOCKS5 listening on {}", proxy.local_addr()?);
 代理默认不会暴露到公网；如果确实需要监听非回环地址，应同时启用用户名密码认证、系统
 防火墙和访问控制。代理只实现 `CONNECT`，不支持 `BIND`、UDP ASSOCIATE 或代理链。
 
+## SSH ProxyJump 与代理链
+
+已经认证的 `SshSession` 可以作为下一跳的传输通道。`connect_via_jump` 会在当前会话上打开
+`direct-tcpip` channel，把目标 SSH 的握手、主机密钥校验和认证完整地运行在该 channel 上：
+
+```rust,no_run
+use xssh_rust_lib::{AuthMethod, KnownHostKeyVerifier, SshConfig, SshSession};
+
+# async fn run(
+#     jump: SshSession,
+# ) -> Result<(), Box<dyn std::error::Error>> {
+let target = jump
+    .connect_via_jump(
+        SshConfig::new("internal.example.com", "alice")?,
+        KnownHostKeyVerifier::from_path("/home/alice/.ssh/known_hosts")?,
+        AuthMethod::password(std::env::var("XSSH_TARGET_PASSWORD")?),
+    )
+    .await?;
+
+// target 可继续用于 terminal、SFTP、direct-tcpip 或 SOCKS5。
+target.disconnect().await?;
+# Ok(())
+# }
+```
+
+多跳链不需要额外的全局配置：让第二跳通过第一跳建立，第三跳再通过第二跳建立即可。每一跳
+独立执行自己的 host-key verifier 和认证计划；跳板服务器只负责转发加密的 SSH 字节流，无法
+替代目标服务器的主机密钥校验。
+
 ## 使用示例
 
 ```rust,no_run
@@ -399,8 +428,8 @@ sftp.close().await?;
 
 ## 当前未包含
 
-GPUI UI、VT100 渲染、SQLite、Keychain、Windows Credential Manager、Unix socket forwarding
-和 SSH ProxyJump/代理链不属于当前基础库。
+GPUI UI、VT100 渲染、SQLite、Keychain、Windows Credential Manager 和 Unix socket forwarding
+不属于当前基础库。
 
 ## 开发检查
 

@@ -4,6 +4,7 @@ use russh::client::{self, AuthResult, Handler, KeyboardInteractiveAuthResponse};
 use russh::keys::agent::client::{AgentClient, AgentStream};
 use russh::keys::{Algorithm, HashAlg, PrivateKeyWithHashAlg, PublicKey};
 use russh::Disconnect;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, Mutex};
 
 use super::channel::PendingForwardedTcpip;
@@ -170,6 +171,99 @@ impl SshSession {
         })
     }
 
+    /// Connect to another SSH server through this authenticated session.
+    ///
+    /// The current session opens a `direct-tcpip` channel to the target SSH
+    /// endpoint. The new SSH transport then runs over that channel, so the
+    /// target can be reached from the jump server's network position. Calling
+    /// this method repeatedly on successive sessions builds a ProxyJump chain.
+    pub async fn connect_via_jump<V, A>(
+        &self,
+        config: SshConfig,
+        verifier: V,
+        auth: A,
+    ) -> Result<Self, SshError>
+    where
+        V: HostKeyVerifier + 'static,
+        A: Into<AuthenticationPlan>,
+    {
+        self.connect_via_jump_with_context(config, verifier, auth, OperationContext::new())
+            .await
+    }
+
+    /// Connect through this session with an explicit deadline or cancellation.
+    pub async fn connect_via_jump_with_context<V, A>(
+        &self,
+        config: SshConfig,
+        verifier: V,
+        auth: A,
+        context: OperationContext,
+    ) -> Result<Self, SshError>
+    where
+        V: HostKeyVerifier + 'static,
+        A: Into<AuthenticationPlan>,
+    {
+        config.validate()?;
+        let host = config.host.clone();
+        let port = config.port;
+        let (forwarded_tcpip_sender, forwarded_tcpip_receiver) =
+            mpsc::channel(FORWARDED_TCPIP_QUEUE_CAPACITY);
+        let handler = ClientHandler {
+            host: host.clone(),
+            port,
+            verifier: Arc::new(verifier),
+            forwarded_tcpip_sender,
+        };
+        let client_config = client::Config {
+            keepalive_interval: config.keepalive_interval,
+            nodelay: true,
+            ..Default::default()
+        };
+
+        let connect_context = context
+            .clone()
+            .with_timeout_from_now(config.connect_timeout);
+        let channel = self
+            .open_raw_direct_tcpip_with_context(
+                config.host.clone(),
+                config.port,
+                "127.0.0.1".to_owned(),
+                0,
+                &connect_context,
+            )
+            .await
+            .map_err(|error| error.with_endpoint(host.clone(), port))?;
+        let stream = channel.into_stream();
+        let mut handle = connect_stream_with_context(
+            connect_context,
+            client_config,
+            stream,
+            handler,
+            host.clone(),
+            port,
+        )
+        .await?;
+
+        let authentication_context = context
+            .clone()
+            .with_timeout_from_now(config.authentication_timeout);
+        let authentication_plan = auth.into();
+        authentication_context
+            .run(
+                "ssh authentication through ProxyJump",
+                authenticate(&mut handle, &config.username, authentication_plan),
+            )
+            .await
+            .map_err(|error| error.with_endpoint(host, port))?;
+
+        Ok(Self {
+            handle,
+            operation_context: context,
+            config,
+            forwarded_tcpip_receiver: Mutex::new(forwarded_tcpip_receiver),
+        })
+    }
+
     pub fn is_closed(&self) -> bool {
         self.handle.is_closed()
     }
@@ -298,6 +392,27 @@ impl SshSession {
             })
             .await
     }
+}
+
+async fn connect_stream_with_context<R>(
+    context: OperationContext,
+    client_config: client::Config,
+    stream: R,
+    handler: ClientHandler,
+    host: String,
+    port: u16,
+) -> Result<client::Handle<ClientHandler>, SshError>
+where
+    R: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    context
+        .run("ssh ProxyJump connect and handshake", async move {
+            client::connect_stream(Arc::new(client_config), stream, handler)
+                .await
+                .map_err(classify_connect_error)
+        })
+        .await
+        .map_err(|error| error.with_endpoint(host, port))
 }
 
 async fn authenticate(
@@ -769,6 +884,44 @@ Vv9WFaQHofuFcUUAAAAaeHNzaC1ydXN0LWxpYiB0ZXN0IGZpeHR1cmUB
         }
     }
 
+    struct JumpServer;
+
+    impl server::Handler for JumpServer {
+        type Error = russh::Error;
+
+        async fn auth_password(
+            &mut self,
+            _user: &str,
+            password: &str,
+        ) -> Result<Auth, Self::Error> {
+            if password == "test-password" {
+                Ok(Auth::Accept)
+            } else {
+                Ok(Auth::reject())
+            }
+        }
+
+        async fn channel_open_direct_tcpip(
+            &mut self,
+            channel: russh::Channel<russh::server::Msg>,
+            host_to_connect: &str,
+            port_to_connect: u32,
+            _originator_address: &str,
+            _originator_port: u32,
+            _session: &mut server::Session,
+        ) -> Result<bool, Self::Error> {
+            let Ok(port) = u16::try_from(port_to_connect) else {
+                return Ok(false);
+            };
+            let mut target = tokio::net::TcpStream::connect((host_to_connect, port)).await?;
+            let mut channel_stream = channel.into_stream();
+            tokio::spawn(async move {
+                let _ = tokio::io::copy_bidirectional(&mut channel_stream, &mut target).await;
+            });
+            Ok(true)
+        }
+    }
+
     struct RemoteForwardServer;
 
     impl server::Handler for RemoteForwardServer {
@@ -1050,6 +1203,83 @@ Vv9WFaQHofuFcUUAAAAaeHNzaC1ydXN0LWxpYiB0ZXN0IGZpeHR1cmUB
             ErrorKind::Cancelled
         );
         session.disconnect().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn connects_to_a_target_ssh_server_through_a_jump_session() {
+        let target_server_key = PrivateKey::random(
+            &mut russh::keys::ssh_key::rand_core::OsRng,
+            Algorithm::Ed25519,
+        )
+        .unwrap();
+        let mut target_server_config = server::Config::default();
+        target_server_config.keys.push(target_server_key.clone());
+        let target_server_config = Arc::new(target_server_config);
+        let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_address = target_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (socket, _) = target_listener.accept().await.unwrap();
+            server::run_stream(target_server_config, socket, PasswordServer)
+                .await
+                .unwrap();
+        });
+
+        let jump_server_key = PrivateKey::random(
+            &mut russh::keys::ssh_key::rand_core::OsRng,
+            Algorithm::Ed25519,
+        )
+        .unwrap();
+        let mut jump_server_config = server::Config::default();
+        jump_server_config.keys.push(jump_server_key.clone());
+        let jump_server_config = Arc::new(jump_server_config);
+        let jump_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let jump_address = jump_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (socket, _) = jump_listener.accept().await.unwrap();
+            server::run_stream(jump_server_config, socket, JumpServer)
+                .await
+                .unwrap();
+        });
+
+        let mut jump_verifier = KnownHostKeyVerifier::new();
+        jump_verifier.insert_key(
+            "127.0.0.1",
+            jump_address.port(),
+            jump_server_key.public_key(),
+        );
+        let mut jump_config = SshConfig::new("127.0.0.1", "alice").unwrap();
+        jump_config.port = jump_address.port();
+        jump_config.connect_timeout = Duration::from_secs(5);
+        let jump_session = SshSession::connect(
+            jump_config,
+            jump_verifier,
+            AuthMethod::password("test-password"),
+        )
+        .await
+        .unwrap();
+
+        let mut target_verifier = KnownHostKeyVerifier::new();
+        target_verifier.insert_key(
+            "127.0.0.1",
+            target_address.port(),
+            target_server_key.public_key(),
+        );
+        let mut target_config = SshConfig::new("127.0.0.1", "alice").unwrap();
+        target_config.port = target_address.port();
+        target_config.connect_timeout = Duration::from_secs(5);
+        let target_session = jump_session
+            .connect_via_jump(
+                target_config,
+                target_verifier,
+                AuthMethod::password("test-password"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(target_session.config().port, target_address.port());
+        assert!(!target_session.is_closed());
+        target_session.disconnect().await.unwrap();
+        jump_session.disconnect().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
