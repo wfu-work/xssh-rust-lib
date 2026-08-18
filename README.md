@@ -1,20 +1,20 @@
 # xssh-rust-lib
 
-`xssh-rust-lib` 现在是一个 Cargo workspace，由三个职责清晰、可独立复用的纯 Rust 包组成：
+`xssh-rust-lib` 是一个纯 Rust SSH 库，一个 package 内按源码目录划分为三个模块：
 
 ```text
-xssh-rust-core       SSH 连接、认证、主机密钥、通用 channel
-        ├── xssh-rust-terminal   PTY、交互式 shell、输入输出、窗口调整
-        └── xssh-rust-sftp       SFTP subsystem、远程文件与目录操作
+xssh-rust-lib
+└── src
+    ├── core       SSH 连接、认证、主机密钥、通用 channel
+    ├── terminal   PTY、交互式 shell、输入输出、窗口调整
+    └── sftp       SFTP subsystem、远程文件与目录操作
 ```
 
-三个包都不依赖 GPUI。GPUI、CLI、Tauri 或其他前端只需要按功能选择依赖即可。
+三个模块共享同一个版本、Cargo 配置和错误类型。GPUI、CLI、Tauri 或其他前端只依赖一个 crate 即可。
 
-## 包结构
+## 模块职责
 
-### `xssh-rust-core`
-
-核心传输层，负责：
+### `core`
 
 - SSH TCP 连接、握手超时和 keepalive；
 - 密码与私钥认证；
@@ -22,11 +22,7 @@ xssh-rust-core       SSH 连接、认证、主机密钥、通用 channel
 - 连接生命周期；
 - 通用 SSH session channel 和异步字节流。
 
-核心包不保存 SQLite、Keychain 或其他平台凭据，也不包含终端渲染。
-
-### `xssh-rust-terminal`
-
-基于 core channel 封装交互式终端：
+### `terminal`
 
 - PTY 分配；
 - 登录 shell 启动；
@@ -34,38 +30,50 @@ xssh-rust-core       SSH 连接、认证、主机密钥、通用 channel
 - 窗口大小调整；
 - EOF、退出状态、退出信号和关闭事件。
 
-### `xssh-rust-sftp`
+该模块只负责 SSH PTY 协议，不负责 VT100/ANSI 解析和界面绘制。
 
-基于 SFTP subsystem 封装远程文件系统操作：
+### `sftp`
 
-- 连接和关闭 SFTP subsystem；
+- SFTP subsystem 初始化和关闭；
 - `read`、`write`、`exists`；
-- 流式文件 `open`、`create` 和显式 `OpenFlags`；
+- 流式 `open`、`create` 和显式 `OpenFlags`；
 - 创建、读取和删除目录；
-- 元数据查询；
-- 文件重命名和路径规范化。
+- 元数据查询、重命名和路径规范化。
 
-## 最小依赖
+## Feature
+
+默认启用 `terminal` 和 `sftp`：
 
 ```toml
 [dependencies]
-xssh-rust-core = "0.2"
-xssh-rust-terminal = "0.2" # 需要交互式终端时添加
-xssh-rust-sftp = "0.2"     # 需要文件传输时添加
+xssh-rust-lib = "0.2"
 ```
 
-先创建并认证 core 会话，再把同一个会话交给 terminal 或 sftp 包：
+如果只需要 SSH core，可以关闭默认功能：
+
+```toml
+[dependencies]
+xssh-rust-lib = { version = "0.2", default-features = false }
+```
+
+也可以按需启用：
+
+```toml
+xssh-rust-lib = { version = "0.2", default-features = false, features = ["terminal"] }
+```
+
+## 使用示例
 
 ```rust,no_run
-use xssh_rust_core::{AuthMethod, KnownHostKeyVerifier, SshConfig, SshSession};
-use xssh_rust_terminal::{TerminalOptions, TerminalSession};
+use xssh_rust_lib::{AuthMethod, KnownHostKeyVerifier, SshConfig, SshSession};
+use xssh_rust_lib::terminal::{TerminalOptions, TerminalSession};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = SshConfig::new("server.example.com", "alice")?;
-    let verifier = KnownHostKeyVerifier::new();
 
     // 生产环境应从受保护的 known-hosts 存储加载指纹。
+    let verifier = KnownHostKeyVerifier::new();
     let session = SshSession::connect(
         config,
         verifier,
@@ -77,7 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     terminal.write(b"echo ready\n").await?;
     while let Some(event) = terminal.next_event().await {
         println!("{event:?}");
-        if matches!(event, xssh_rust_terminal::TerminalEvent::Close) {
+        if matches!(event, xssh_rust_lib::terminal::TerminalEvent::Close) {
             break;
         }
     }
@@ -87,12 +95,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-SFTP 的使用方式相同：
+SFTP 使用同一个 core 会话：
 
 ```rust,no_run
-use xssh_rust_sftp::SftpClient;
+use xssh_rust_lib::sftp::SftpClient;
 
-# async fn run(session: &xssh_rust_core::SshSession) -> Result<(), Box<dyn std::error::Error>> {
+# async fn run(session: &xssh_rust_lib::SshSession) -> Result<(), Box<dyn std::error::Error>> {
 let sftp = SftpClient::connect(session).await?;
 sftp.write("/tmp/hello.txt", b"hello").await?;
 let bytes = sftp.read("/tmp/hello.txt").await?;
@@ -111,7 +119,7 @@ sftp.close().await?;
 
 ## 当前未包含
 
-GPUI UI、VT100 渲染、SQLite、Keychain、Windows Credential Manager、SSH agent、端口转发和代理链不属于本批次。它们可以在上层应用或后续独立包中实现。
+GPUI UI、VT100 渲染、SQLite、Keychain、Windows Credential Manager、SSH agent、端口转发和代理链不属于当前基础库。
 
 ## 开发检查
 
@@ -122,11 +130,11 @@ cargo fmt -- --check
 
 CARGO_HOME=/tmp/xssh-rust-lib-cargo \
 CARGO_TARGET_DIR=/tmp/xssh-rust-lib-target \
-cargo test --workspace --all-features
+cargo test --all-features
 
 CARGO_HOME=/tmp/xssh-rust-lib-cargo \
 CARGO_TARGET_DIR=/tmp/xssh-rust-lib-target \
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo clippy --all-targets --all-features -- -D warnings
 ```
 
 核心库使用 MIT 许可证。

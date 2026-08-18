@@ -1,6 +1,6 @@
-//! Interactive SSH terminal primitives built on top of `xssh-rust-core`.
+//! Interactive SSH terminal primitives built on top of the `core` module.
 
-use xssh_rust_core::{SshChannel, SshChannelEvent, SshChannelStream, SshError, SshSession};
+use crate::core::{SshChannel, SshChannelEvent, SshChannelStream, SshError, SshSession};
 
 /// PTY and shell settings for a terminal session.
 #[derive(Clone, Debug, Eq, PartialEq)]

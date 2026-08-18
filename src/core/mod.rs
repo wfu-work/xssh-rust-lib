@@ -1,8 +1,4 @@
-//! Pure Rust SSH core primitives.
-//!
-//! This crate intentionally contains transport and protocol concerns only. UI,
-//! terminal emulation, persistence, and platform credential stores belong in
-//! higher-level crates.
+//! SSH transport, authentication, host-key verification, and generic channels.
 
 mod auth;
 mod channel;

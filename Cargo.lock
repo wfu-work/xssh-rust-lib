@@ -1916,30 +1916,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 
 [[package]]
-name = "xssh-rust-core"
+name = "xssh-rust-lib"
 version = "0.2.0"
 dependencies = [
  "russh",
- "tokio",
- "zeroize",
-]
-
-[[package]]
-name = "xssh-rust-sftp"
-version = "0.2.0"
-dependencies = [
  "russh-sftp",
  "tokio",
- "xssh-rust-core",
-]
-
-[[package]]
-name = "xssh-rust-terminal"
-version = "0.2.0"
-dependencies = [
- "russh",
- "tokio",
- "xssh-rust-core",
+ "zeroize",
 ]
 
 [[package]]

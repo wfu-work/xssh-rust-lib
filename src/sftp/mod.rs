@@ -1,9 +1,9 @@
-//! High-level SFTP operations for an authenticated `xssh-rust-core` session.
+//! High-level SFTP operations for an authenticated `core::SshSession`.
 
 use std::fmt;
 
+use crate::core::{SshError, SshSession};
 use russh_sftp::client::{fs, SftpSession};
-use xssh_rust_core::{SshError, SshSession};
 
 pub use fs::{File as SftpFile, Metadata};
 pub use russh_sftp::protocol::OpenFlags;
