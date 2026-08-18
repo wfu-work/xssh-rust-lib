@@ -1,0 +1,16 @@
+[package]
+name = "xssh-rust-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pure Rust SSH transport, authentication, and host-key verification core"
+readme = "README.md"
+
+[dependencies]
+russh.workspace = true
+tokio.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

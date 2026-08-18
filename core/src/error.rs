@@ -30,7 +30,7 @@ impl SshError {
         }
     }
 
-    pub(crate) fn configuration(message: impl Into<String>) -> Self {
+    pub fn configuration(message: impl Into<String>) -> Self {
         Self::new(ErrorKind::Configuration, message)
     }
 

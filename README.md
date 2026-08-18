@@ -1,31 +1,71 @@
 # xssh-rust-lib
 
-`xssh-rust-lib` 是一个纯 Rust SSH/Core 依赖库，为 GPUI 桌面端、CLI、Tauri 或其他前端提供可复用的 SSH 传输基础。它不包含 UI、终端渲染或平台数据存储。
+`xssh-rust-lib` 现在是一个 Cargo workspace，由三个职责清晰、可独立复用的纯 Rust 包组成：
 
-## 当前能力
+```text
+xssh-rust-core       SSH 连接、认证、主机密钥、通用 channel
+        ├── xssh-rust-terminal   PTY、交互式 shell、输入输出、窗口调整
+        └── xssh-rust-sftp       SFTP subsystem、远程文件与目录操作
+```
 
-- SSH TCP 连接和协议握手，基于固定版本 `russh 0.54.3`；
-- 可配置连接超时、TCP_NODELAY 和 keepalive；
-- 密码认证和 OpenSSH 私钥认证；
-- 加密私钥在认证前解密，密码和 passphrase 使用 `zeroize` 包装，并且不会出现在 `Debug` 或 `Display` 输出中；
-- 强制执行服务器主机密钥校验，不默认信任未知密钥；
-- SHA-256 主机密钥指纹和严格的内存 known-hosts 校验器；
-- 按配置、连接、握手、主机密钥、认证、通道和超时阶段分类的错误。
+三个包都不依赖 GPUI。GPUI、CLI、Tauri 或其他前端只需要按功能选择依赖即可。
 
-## 最小用法
+## 包结构
+
+### `xssh-rust-core`
+
+核心传输层，负责：
+
+- SSH TCP 连接、握手超时和 keepalive；
+- 密码与私钥认证；
+- 服务器主机密钥指纹校验；
+- 连接生命周期；
+- 通用 SSH session channel 和异步字节流。
+
+核心包不保存 SQLite、Keychain 或其他平台凭据，也不包含终端渲染。
+
+### `xssh-rust-terminal`
+
+基于 core channel 封装交互式终端：
+
+- PTY 分配；
+- 登录 shell 启动；
+- 输入写入和输出事件读取；
+- 窗口大小调整；
+- EOF、退出状态、退出信号和关闭事件。
+
+### `xssh-rust-sftp`
+
+基于 SFTP subsystem 封装远程文件系统操作：
+
+- 连接和关闭 SFTP subsystem；
+- `read`、`write`、`exists`；
+- 流式文件 `open`、`create` 和显式 `OpenFlags`；
+- 创建、读取和删除目录；
+- 元数据查询；
+- 文件重命名和路径规范化。
+
+## 最小依赖
+
+```toml
+[dependencies]
+xssh-rust-core = "0.2"
+xssh-rust-terminal = "0.2" # 需要交互式终端时添加
+xssh-rust-sftp = "0.2"     # 需要文件传输时添加
+```
+
+先创建并认证 core 会话，再把同一个会话交给 terminal 或 sftp 包：
 
 ```rust,no_run
-use xssh_rust_lib::{AuthMethod, KnownHostKeyVerifier, PublicKey, SshConfig, SshSession};
+use xssh_rust_core::{AuthMethod, KnownHostKeyVerifier, SshConfig, SshSession};
+use xssh_rust_terminal::{TerminalOptions, TerminalSession};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = SshConfig::new("server.example.com", "alice")?;
+    let verifier = KnownHostKeyVerifier::new();
 
-    // 生产环境应从受保护的 known-hosts 存储加载，而不是自动接受未知密钥。
-    let server_key = PublicKey::from_openssh(&std::fs::read_to_string("server-key.pub")?)?;
-    let mut verifier = KnownHostKeyVerifier::new();
-    verifier.insert_key(&config.host, config.port, server_key.public_key());
-
+    // 生产环境应从受保护的 known-hosts 存储加载指纹。
     let session = SshSession::connect(
         config,
         verifier,
@@ -33,31 +73,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    println!("connected: {}", !session.is_closed());
+    let mut terminal = TerminalSession::open(&session, TerminalOptions::default()).await?;
+    terminal.write(b"echo ready\n").await?;
+    while let Some(event) = terminal.next_event().await {
+        println!("{event:?}");
+        if matches!(event, xssh_rust_terminal::TerminalEvent::Close) {
+            break;
+        }
+    }
+
     session.disconnect().await?;
     Ok(())
 }
 ```
 
-上面的 `server-key.pub` 仅用于展示密钥类型；实际应用应加载服务器的公钥，而不是把服务器私钥放入客户端。应用也可以实现 `HostKeyVerifier`，将 `HostKeyDecision::Unknown` 交给用户确认，并把确认结果写入自己的加密存储。
+SFTP 的使用方式相同：
 
-## 设计边界
+```rust,no_run
+use xssh_rust_sftp::SftpClient;
 
-本批次只实现核心连接生命周期和认证基础层，暂不包含：
+# async fn run(session: &xssh_rust_core::SshSession) -> Result<(), Box<dyn std::error::Error>> {
+let sftp = SftpClient::connect(session).await?;
+sftp.write("/tmp/hello.txt", b"hello").await?;
+let bytes = sftp.read("/tmp/hello.txt").await?;
+assert_eq!(bytes, b"hello");
+sftp.close().await?;
+# Ok(())
+# }
+```
 
-- GPUI 或其他 UI 框架；
-- PTY、交互式 shell、终端 VT100 渲染；
-- `exec`、SFTP、端口转发和代理链；
-- SQLite、macOS Keychain、Windows Credential Manager 等平台存储。
+## 安全边界
 
-这些功能会在后续独立的大功能提交中添加，并保持核心库不依赖具体桌面 UI 或存储实现。
+- core 默认拒绝未知或变更的服务器主机密钥；
+- 密码和私钥 passphrase 使用 `zeroize` 包装，不应写入日志或持久化配置；
+- known-hosts 持久化由上层应用负责，应使用系统密钥链或经过审计的加密存储；
+- terminal 和 sftp 不绕过 core 的认证和主机密钥策略。
 
-## 安全约束
+## 当前未包含
 
-1. `SshSession::connect` 必须收到 `HostKeyVerifier`，未知或变更的服务器密钥会终止连接。
-2. 不要在日志、错误文本或配置持久化中写入密码、私钥内容或 passphrase。
-3. 不要在客户端自动接受未知主机密钥；应由上层 UI 明确展示指纹并获得用户确认。
-4. 本库不负责密钥持久化。上层应用应使用系统密钥链或其他经过审计的加密存储。
+GPUI UI、VT100 渲染、SQLite、Keychain、Windows Credential Manager、SSH agent、端口转发和代理链不属于本批次。它们可以在上层应用或后续独立包中实现。
 
 ## 开发检查
 
@@ -68,11 +122,11 @@ cargo fmt -- --check
 
 CARGO_HOME=/tmp/xssh-rust-lib-cargo \
 CARGO_TARGET_DIR=/tmp/xssh-rust-lib-target \
-cargo test --all-features
+cargo test --workspace --all-features
 
 CARGO_HOME=/tmp/xssh-rust-lib-cargo \
 CARGO_TARGET_DIR=/tmp/xssh-rust-lib-target \
-cargo build --all-features
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
-首次构建可能需要下载 `ring` 等 Rust 加密依赖。核心库使用 MIT 许可证。
+核心库使用 MIT 许可证。

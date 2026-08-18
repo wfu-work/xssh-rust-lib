@@ -88,6 +88,15 @@ impl SshSession {
         &self.config
     }
 
+    pub(crate) async fn open_raw_session_channel(
+        &self,
+    ) -> Result<russh::Channel<russh::client::Msg>, SshError> {
+        self.handle
+            .channel_open_session()
+            .await
+            .map_err(|error| SshError::channel(error.to_string()))
+    }
+
     pub async fn disconnect(&self) -> Result<(), SshError> {
         self.handle
             .disconnect(Disconnect::ByApplication, "client closed session", "")

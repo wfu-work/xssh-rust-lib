@@ -1,18 +1,15 @@
-[package]
-name = "xssh-rust-lib"
-version = "0.1.0"
+[workspace]
+members = ["core", "terminal", "sftp"]
+resolver = "2"
+
+[workspace.package]
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
-description = "Pure Rust SSH core library for desktop clients and command-line tools"
 repository = "https://github.com/wfu-work/xssh-rust-lib"
-readme = "README.md"
-keywords = ["ssh", "rust", "terminal"]
-categories = ["network-programming", "authentication"]
 
-[dependencies]
+[workspace.dependencies]
 russh = { version = "=0.54.3", default-features = false, features = ["ring"] }
 tokio = { version = "1", features = ["net", "rt", "time"] }
 zeroize = "1.8.1"
-
-[dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+russh-sftp = "=2.1.0"

@@ -1,0 +1,15 @@
+[package]
+name = "xssh-rust-sftp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SFTP client primitives built on top of xssh-rust-core"
+readme = "README.md"
+
+[dependencies]
+xssh-rust-core = { path = "../core" }
+russh-sftp.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
