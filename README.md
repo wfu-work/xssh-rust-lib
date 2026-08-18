@@ -102,6 +102,67 @@ cancellation.cancel();
 
 `SshError` 会保留错误源（如果底层库提供）、错误阶段、operation、host/port、远程 path 和 `is_retryable()` 标记；这些字段不包含密码或私钥内容，适合交给 GPUI 的状态层和日志层。
 
+## 主机密钥、known_hosts 与 TOFU
+
+`KnownHostKeyVerifier` 是严格的内存校验器，可以直接解析 OpenSSH
+`known_hosts` 文本或文件：
+
+```rust,no_run
+use xssh_rust_lib::{AuthMethod, KnownHostKeyVerifier, SshConfig, SshSession};
+
+# async fn run() -> Result<(), Box<dyn std::error::Error>> {
+let verifier = KnownHostKeyVerifier::from_path("/home/alice/.ssh/known_hosts")?;
+let config = SshConfig::new("server.example.com", "alice")?;
+let session = SshSession::connect(
+    config,
+    verifier,
+    AuthMethod::password(std::env::var("XSSH_PASSWORD")?),
+)
+.await?;
+session.disconnect().await?;
+# Ok(())
+# }
+```
+
+解析和匹配支持普通主机、`[host]:port`、`*`/`?` 通配符、`!` 排除模式以及
+OpenSSH `|1|salt|hmac` hashed host。`@revoked` 条目会返回
+`HostKeyDecision::Revoked`；`@cert-authority` 会被保留为结构化 marker，但当前
+库只验证直接提供的服务器公钥，不执行 SSH host certificate 的 CA 验证。
+
+`KnownHostKeyVerifier::check` 返回 `HostKeyObservation`，其中包含 presented
+fingerprint、匹配的 known_hosts 行号、期望指纹和 `Trusted`、`Unknown`、`Changed`
+或 `Revoked` 决策，适合直接交给 GPUI 的信任确认状态层。`SshSession` 会拒绝
+`Unknown`、`Changed` 和 `Revoked`；调用 `SshError::host_key_observation()` 可以直接
+读取同一份结构化信息，无需解析错误字符串。
+
+需要明确采用 trust-on-first-use 时，可以使用 `TofuHostKeyVerifier`：首次出现的
+公钥会在内存中记录并接受，后续 changed/revoked key 仍会拒绝。连接成功后由上层
+负责安全持久化快照，核心库不会直接写用户配置文件：
+
+```rust,no_run
+use xssh_rust_lib::{
+    AuthMethod, KnownHostKeyVerifier, SshConfig, SshSession, TofuHostKeyVerifier,
+};
+
+# async fn run() -> Result<(), Box<dyn std::error::Error>> {
+let verifier = TofuHostKeyVerifier::new(KnownHostKeyVerifier::new());
+let retained_verifier = verifier.clone();
+let session = SshSession::connect(
+    SshConfig::new("server.example.com", "alice")?,
+    verifier,
+    AuthMethod::password(std::env::var("XSSH_PASSWORD")?),
+)
+.await?;
+
+let snapshot = retained_verifier.snapshot()?;
+let known_hosts_text = snapshot.known_hosts().to_openssh();
+// 由应用使用原子替换和 Keychain/权限控制保存 known_hosts_text。
+let _ = known_hosts_text;
+session.disconnect().await?;
+# Ok(())
+# }
+```
+
 ## 使用示例
 
 ```rust,no_run
@@ -112,8 +173,8 @@ use xssh_rust_lib::terminal::{TerminalOptions, TerminalSession};
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = SshConfig::new("server.example.com", "alice")?;
 
-    // 生产环境应从受保护的 known-hosts 存储加载指纹。
-    let verifier = KnownHostKeyVerifier::new();
+    // 生产环境应从受保护的 known_hosts 存储加载条目。
+    let verifier = KnownHostKeyVerifier::from_path("/home/alice/.ssh/known_hosts")?;
     let session = SshSession::connect(
         config,
         verifier,
@@ -152,7 +213,7 @@ sftp.close().await?;
 
 ## 安全边界
 
-- core 默认拒绝未知或变更的服务器主机密钥；
+- `KnownHostKeyVerifier` 默认拒绝未知、变更或 revoked 的服务器主机密钥；需要自动首次信任时显式使用 `TofuHostKeyVerifier`；
 - 密码和私钥 passphrase 使用 `zeroize` 包装，不应写入日志或持久化配置；
 - known-hosts 持久化由上层应用负责，应使用系统密钥链或经过审计的加密存储；
 - terminal 和 sftp 不绕过 core 的认证和主机密钥策略。

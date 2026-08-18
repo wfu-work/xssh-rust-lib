@@ -1,6 +1,8 @@
 use std::fmt;
 use std::sync::Arc;
 
+use super::host_key::HostKeyObservation;
+
 /// Broad phase in which an SSH operation failed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -24,6 +26,7 @@ pub struct ErrorContext {
     host: Option<String>,
     port: Option<u16>,
     path: Option<String>,
+    host_key_observation: Option<HostKeyObservation>,
 }
 
 impl ErrorContext {
@@ -41,6 +44,10 @@ impl ErrorContext {
 
     pub fn path(&self) -> Option<&str> {
         self.path.as_deref()
+    }
+
+    pub fn host_key_observation(&self) -> Option<&HostKeyObservation> {
+        self.host_key_observation.as_ref()
     }
 }
 
@@ -116,6 +123,11 @@ impl SshError {
         self
     }
 
+    pub(crate) fn with_host_key_observation(mut self, observation: HostKeyObservation) -> Self {
+        self.context.host_key_observation = Some(observation);
+        self
+    }
+
     pub fn with_retryable(mut self, retryable: bool) -> Self {
         self.retryable = retryable;
         self
@@ -149,6 +161,10 @@ impl SshError {
 
     pub fn path(&self) -> Option<&str> {
         self.context.path()
+    }
+
+    pub fn host_key_observation(&self) -> Option<&HostKeyObservation> {
+        self.context.host_key_observation()
     }
 
     pub fn is_retryable(&self) -> bool {

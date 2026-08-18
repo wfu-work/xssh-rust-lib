@@ -12,7 +12,10 @@ pub use auth::{AuthMethod, SecretString};
 pub use channel::{SshChannel, SshChannelEvent, SshChannelStream};
 pub use config::SshConfig;
 pub use error::{ErrorContext, ErrorKind, SshError};
-pub use host_key::{HostKeyDecision, HostKeyVerifier, KnownHostKeyVerifier};
+pub use host_key::{
+    HostKeyDecision, HostKeyObservation, HostKeyVerifier, KnownHostEntry, KnownHostKeyVerifier,
+    KnownHostMarker, KnownHosts, TofuHostKeyVerifier,
+};
 pub use operation::{CancellationToken, OperationContext};
 pub use session::SshSession;
 

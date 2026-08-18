@@ -10,7 +10,10 @@ keywords = ["ssh", "rust", "terminal", "sftp"]
 categories = ["network-programming", "authentication", "filesystem"]
 
 [dependencies]
+base64ct = { version = "1.6", features = ["alloc"] }
+hmac = "0.12"
 russh = { version = "=0.54.3", default-features = false, features = ["ring"] }
+sha1 = "0.10"
 tokio = { version = "1", features = ["macros", "net", "rt", "sync", "time"] }
 zeroize = "1.8.1"
 russh-sftp = { version = "=2.1.0", optional = true }

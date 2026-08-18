@@ -13,6 +13,7 @@ pub mod sftp;
 
 pub use core::{
     Algorithm, AuthMethod, CancellationToken, ErrorContext, ErrorKind, HashAlg, HostKeyDecision,
-    HostKeyVerifier, KnownHostKeyVerifier, OperationContext, PrivateKey, PublicKey, SecretString,
-    SshChannel, SshChannelEvent, SshChannelStream, SshConfig, SshError, SshSession,
+    HostKeyObservation, HostKeyVerifier, KnownHostEntry, KnownHostKeyVerifier, KnownHostMarker,
+    KnownHosts, OperationContext, PrivateKey, PublicKey, SecretString, SshChannel, SshChannelEvent,
+    SshChannelStream, SshConfig, SshError, SshSession, TofuHostKeyVerifier,
 };

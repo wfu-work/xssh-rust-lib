@@ -19,21 +19,42 @@ impl Handler for ClientHandler {
         &mut self,
         server_public_key: &PublicKey,
     ) -> Result<bool, Self::Error> {
-        match self
+        let decision = self
             .verifier
-            .verify(&self.host, self.port, server_public_key)?
-        {
+            .verify(&self.host, self.port, server_public_key)?;
+        if decision == HostKeyDecision::Trusted {
+            return Ok(true);
+        }
+
+        let mut observation = self
+            .verifier
+            .check(&self.host, self.port, server_public_key)?;
+        observation.decision = decision;
+        match decision {
             HostKeyDecision::Trusted => Ok(true),
             HostKeyDecision::Unknown => Err(SshError::host_key(format!(
-                "unknown host key for {}:{} (fingerprint: {})",
+                "unknown host key for {}:{} (presented fingerprint: {})",
+                self.host, self.port, observation.presented_fingerprint
+            ))
+            .with_host_key_observation(observation)),
+            HostKeyDecision::Changed => Err(SshError::host_key(format!(
+                "host key changed for {}:{} (expected: {}; presented: {}; lines: {:?})",
                 self.host,
                 self.port,
-                server_public_key.fingerprint(russh::keys::HashAlg::Sha256)
-            ))),
-            HostKeyDecision::Changed => Err(SshError::host_key(format!(
-                "host key changed for {}:{}",
-                self.host, self.port
-            ))),
+                if observation.expected_fingerprints.is_empty() {
+                    "<none>".to_owned()
+                } else {
+                    observation.expected_fingerprints.join(", ")
+                },
+                observation.presented_fingerprint,
+                observation.matched_lines
+            ))
+            .with_host_key_observation(observation)),
+            HostKeyDecision::Revoked => Err(SshError::host_key(format!(
+                "revoked host key for {}:{} (fingerprint: {}; lines: {:?})",
+                self.host, self.port, observation.presented_fingerprint, observation.matched_lines
+            ))
+            .with_host_key_observation(observation)),
         }
     }
 }
@@ -235,12 +256,16 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use russh::client::Handler as _;
     use russh::keys::{Algorithm, PrivateKey};
     use russh::server::{self, Auth};
     use tokio::net::TcpListener;
 
-    use super::SshSession;
-    use crate::{AuthMethod, KnownHostKeyVerifier, SshConfig};
+    use super::{ClientHandler, SshSession};
+    use crate::{
+        AuthMethod, HostKeyDecision, HostKeyVerifier, KnownHostKeyVerifier, SshConfig,
+        TofuHostKeyVerifier,
+    };
 
     struct PasswordServer;
 
@@ -309,6 +334,77 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(1)).await;
         let second_deadline = session.operation_context().deadline().unwrap();
         assert!(second_deadline > first_deadline);
+        session.disconnect().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn changed_key_error_exposes_a_structured_observation() {
+        let expected_key = PrivateKey::random(
+            &mut russh::keys::ssh_key::rand_core::OsRng,
+            Algorithm::Ed25519,
+        )
+        .unwrap()
+        .public_key()
+        .clone();
+        let presented_key = PrivateKey::random(
+            &mut russh::keys::ssh_key::rand_core::OsRng,
+            Algorithm::Ed25519,
+        )
+        .unwrap()
+        .public_key()
+        .clone();
+        let mut verifier = KnownHostKeyVerifier::new();
+        verifier.insert_key("server.example.com", 22, &expected_key);
+        let mut handler = ClientHandler {
+            host: "server.example.com".to_owned(),
+            port: 22,
+            verifier: Arc::new(verifier),
+        };
+
+        let error = handler.check_server_key(&presented_key).await.unwrap_err();
+        let observation = error.host_key_observation().unwrap();
+        assert_eq!(observation.decision, HostKeyDecision::Changed);
+        assert_eq!(observation.host, "server.example.com");
+        assert_eq!(observation.expected_fingerprints.len(), 1);
+        assert!(observation.presented_fingerprint.starts_with("SHA256:"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tofu_accepts_and_records_the_first_server_key() {
+        let server_key = PrivateKey::random(
+            &mut russh::keys::ssh_key::rand_core::OsRng,
+            Algorithm::Ed25519,
+        )
+        .unwrap();
+        let mut server_config = server::Config::default();
+        server_config.keys.push(server_key.clone());
+        let server_config = Arc::new(server_config);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            server::run_stream(server_config, socket, PasswordServer)
+                .await
+                .unwrap();
+        });
+
+        let verifier = TofuHostKeyVerifier::default();
+        let retained_verifier = verifier.clone();
+        let mut config = SshConfig::new("127.0.0.1", "alice").unwrap();
+        config.port = address.port();
+        config.connect_timeout = Duration::from_secs(5);
+
+        let session = SshSession::connect(config, verifier, AuthMethod::password("test-password"))
+            .await
+            .unwrap();
+        let snapshot = retained_verifier.snapshot().unwrap();
+        assert_eq!(
+            snapshot
+                .verify("127.0.0.1", address.port(), server_key.public_key())
+                .unwrap(),
+            HostKeyDecision::Trusted
+        );
         session.disconnect().await.unwrap();
     }
 
