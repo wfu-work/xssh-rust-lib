@@ -15,7 +15,8 @@ pub use auth::{
     KeyboardInteractivePrompt, RsaHashAlgorithm, SecretString, ServerAuthMethod,
 };
 pub use channel::{
-    SshChannel, SshChannelEvent, SshChannelStream, SshForwardedTcpipChannel, SshRemoteTcpipForward,
+    SshChannel, SshChannelEvent, SshChannelStream, SshForwardedStreamlocalChannel,
+    SshForwardedTcpipChannel, SshRemoteStreamlocalForward, SshRemoteTcpipForward,
 };
 pub use config::SshConfig;
 pub use error::{ErrorContext, ErrorKind, SshError};

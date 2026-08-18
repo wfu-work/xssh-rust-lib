@@ -20,7 +20,7 @@ xssh-rust-lib
 - 密码、私钥、键盘交互、SSH agent 和 OpenSSH 用户证书认证；
 - 服务器主机密钥指纹校验；
 - 连接生命周期；
-- 通用 SSH session channel、direct-tcpip/ProxyJump 端口转发和异步字节流；
+- 通用 SSH session channel、TCP/Unix socket 转发、ProxyJump 和异步字节流；
 - 可复用的 `CancellationToken`、`OperationContext` 和结构化 `SshError`。
 
 ### `terminal`
@@ -296,6 +296,30 @@ session.cancel_remote_tcpip_forward(&forward).await?;
 会使用服务端分配的实际端口；服务端返回非法端口或动态端口缺失会报告
 `ErrorKind::Protocol`。
 
+## Unix socket 转发
+
+`open_direct_streamlocal` 打开一个由 SSH 服务端访问的 Unix socket channel，返回的
+`SshChannelStream` 可以与本地 Unix socket 或其他异步字节流 relay：
+
+```rust,no_run
+use xssh_rust_lib::SshSession;
+
+# async fn run(session: &SshSession) -> Result<(), Box<dyn std::error::Error>> {
+let channel = session
+    .open_direct_streamlocal("/var/run/docker.sock")
+    .await?;
+let mut remote = channel.into_stream();
+remote.write(b"GET /_ping HTTP/1.1\r\nHost: docker\r\n\r\n").await?;
+# Ok(())
+# }
+```
+
+需要让 SSH 服务端接收反向 Unix socket 连接时，使用
+`request_remote_streamlocal_forward`，再通过 `next_forwarded_streamlocal` 消费 channel，
+最后调用 `cancel_remote_streamlocal_forward`。请求和取消操作需要独占
+`&mut SshSession`，与远程 TCP 转发保持一致。socket 路径不能为空或包含 NUL；SSH 服务端
+是否允许 `direct-streamlocal@openssh.com` 和 `streamlocal-forward@openssh.com` 由服务端策略决定。
+
 ## SOCKS5 动态代理
 
 `Socks5Proxy` 在本地监听 SOCKS5 客户端，把每个 `CONNECT` 请求转换为 SSH
@@ -428,8 +452,7 @@ sftp.close().await?;
 
 ## 当前未包含
 
-GPUI UI、VT100 渲染、SQLite、Keychain、Windows Credential Manager 和 Unix socket forwarding
-不属于当前基础库。
+GPUI UI、VT100 渲染、SQLite、Keychain 和 Windows Credential Manager 不属于当前基础库。
 
 ## 开发检查
 

@@ -63,6 +63,23 @@ impl SshRemoteTcpipForward {
     }
 }
 
+/// A server-side Unix socket forwarding request accepted by the SSH server.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SshRemoteStreamlocalForward {
+    socket_path: String,
+}
+
+impl SshRemoteStreamlocalForward {
+    pub(crate) fn new(socket_path: String) -> Self {
+        Self { socket_path }
+    }
+
+    /// Unix socket path on which the SSH server requested the remote listener.
+    pub fn socket_path(&self) -> &str {
+        &self.socket_path
+    }
+}
+
 /// One incoming connection from a remote TCP/IP forward.
 pub struct SshForwardedTcpipChannel {
     connected_address: String,
@@ -126,12 +143,54 @@ impl SshForwardedTcpipChannel {
     }
 }
 
+/// One incoming connection from a remote Unix socket forward.
+pub struct SshForwardedStreamlocalChannel {
+    socket_path: String,
+    channel: SshChannel,
+}
+
+impl fmt::Debug for SshForwardedStreamlocalChannel {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SshForwardedStreamlocalChannel")
+            .field("socket_path", &self.socket_path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SshForwardedStreamlocalChannel {
+    pub(crate) fn new(socket_path: String, channel: SshChannel) -> Self {
+        Self {
+            socket_path,
+            channel,
+        }
+    }
+
+    /// Server-side socket path associated with this forwarded connection.
+    pub fn socket_path(&self) -> &str {
+        &self.socket_path
+    }
+
+    pub fn into_channel(self) -> SshChannel {
+        self.channel
+    }
+
+    pub fn into_stream(self) -> SshChannelStream {
+        self.channel.into_stream()
+    }
+}
+
 pub(crate) struct PendingForwardedTcpip {
     pub(crate) channel: russh::Channel<russh::client::Msg>,
     pub(crate) connected_address: String,
     pub(crate) connected_port: u32,
     pub(crate) originator_address: String,
     pub(crate) originator_port: u32,
+}
+
+pub(crate) struct PendingForwardedStreamlocal {
+    pub(crate) channel: russh::Channel<russh::client::Msg>,
+    pub(crate) socket_path: String,
 }
 
 impl SshSession {
@@ -222,6 +281,35 @@ impl SshSession {
             )
             .await?;
 
+        Ok(SshChannel::from_inner(
+            channel,
+            context.clone(),
+            self.config().operation_timeout,
+        ))
+    }
+
+    /// Open a channel to a Unix socket reachable by the SSH server.
+    pub async fn open_direct_streamlocal(
+        &self,
+        socket_path: impl Into<String>,
+    ) -> Result<SshChannel, SshError> {
+        let context = self
+            .base_context()
+            .with_timeout_from_now(self.config().operation_timeout);
+        self.open_direct_streamlocal_with_context(socket_path, &context)
+            .await
+    }
+
+    /// Open a remote Unix socket channel with an explicit operation context.
+    pub async fn open_direct_streamlocal_with_context(
+        &self,
+        socket_path: impl Into<String>,
+        context: &OperationContext,
+    ) -> Result<SshChannel, SshError> {
+        let socket_path = validate_streamlocal_path(socket_path.into())?;
+        let channel = self
+            .open_raw_direct_streamlocal_with_context(socket_path, context)
+            .await?;
         Ok(SshChannel::from_inner(
             channel,
             context.clone(),
@@ -340,6 +428,81 @@ impl SshSession {
             .await
     }
 
+    /// Ask the SSH server to listen for remote Unix socket connections.
+    pub async fn request_remote_streamlocal_forward(
+        &mut self,
+        socket_path: impl Into<String>,
+    ) -> Result<SshRemoteStreamlocalForward, SshError> {
+        let context = self
+            .base_context()
+            .with_timeout_from_now(self.config().operation_timeout);
+        self.request_remote_streamlocal_forward_with_context(socket_path, &context)
+            .await
+    }
+
+    /// Ask the SSH server to listen on a Unix socket with an explicit context.
+    pub async fn request_remote_streamlocal_forward_with_context(
+        &mut self,
+        socket_path: impl Into<String>,
+        context: &OperationContext,
+    ) -> Result<SshRemoteStreamlocalForward, SshError> {
+        let socket_path = validate_streamlocal_path(socket_path.into())?;
+        self.request_raw_streamlocal_forward_with_context(socket_path.clone(), context)
+            .await?;
+        Ok(SshRemoteStreamlocalForward::new(socket_path))
+    }
+
+    /// Wait for the next connection accepted by a remote Unix socket forward.
+    pub async fn next_forwarded_streamlocal(
+        &self,
+    ) -> Result<Option<SshForwardedStreamlocalChannel>, SshError> {
+        let context = self.base_context();
+        self.next_forwarded_streamlocal_with_context(&context).await
+    }
+
+    /// Wait for the next remote Unix socket connection with cancellation.
+    pub async fn next_forwarded_streamlocal_with_context(
+        &self,
+        context: &OperationContext,
+    ) -> Result<Option<SshForwardedStreamlocalChannel>, SshError> {
+        let pending = self
+            .next_raw_forwarded_streamlocal_with_context(context)
+            .await?;
+        let Some(pending) = pending else {
+            return Ok(None);
+        };
+        Ok(Some(SshForwardedStreamlocalChannel::new(
+            pending.socket_path,
+            SshChannel::from_inner(
+                pending.channel,
+                self.base_context(),
+                self.config().operation_timeout,
+            ),
+        )))
+    }
+
+    /// Cancel a previously registered remote Unix socket forward.
+    pub async fn cancel_remote_streamlocal_forward(
+        &mut self,
+        forward: &SshRemoteStreamlocalForward,
+    ) -> Result<(), SshError> {
+        let context = self
+            .base_context()
+            .with_timeout_from_now(self.config().operation_timeout);
+        self.cancel_remote_streamlocal_forward_with_context(forward, &context)
+            .await
+    }
+
+    /// Cancel a remote Unix socket forward with an explicit context.
+    pub async fn cancel_remote_streamlocal_forward_with_context(
+        &mut self,
+        forward: &SshRemoteStreamlocalForward,
+        context: &OperationContext,
+    ) -> Result<(), SshError> {
+        self.cancel_raw_streamlocal_forward_with_context(forward.socket_path.clone(), context)
+            .await
+    }
+
     /// Open a generic SSH session channel after authentication.
     pub async fn open_session_channel(&self) -> Result<SshChannel, SshError> {
         self.open_session_channel_with_context(self.base_context())
@@ -355,6 +518,20 @@ impl SshSession {
             .await
             .map(|inner| SshChannel::from_inner(inner, context, self.config().operation_timeout))
     }
+}
+
+fn validate_streamlocal_path(socket_path: String) -> Result<String, SshError> {
+    if socket_path.trim().is_empty() {
+        return Err(SshError::configuration(
+            "streamlocal socket path must not be empty",
+        ));
+    }
+    if socket_path.contains('\0') {
+        return Err(SshError::configuration(
+            "streamlocal socket path must not contain NUL",
+        ));
+    }
+    Ok(socket_path)
 }
 
 impl SshChannel {

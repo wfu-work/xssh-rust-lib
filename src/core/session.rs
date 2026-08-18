@@ -7,7 +7,7 @@ use russh::Disconnect;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, Mutex};
 
-use super::channel::PendingForwardedTcpip;
+use super::channel::{PendingForwardedStreamlocal, PendingForwardedTcpip};
 
 use crate::{
     AuthMethod, AuthenticationObservation, AuthenticationPlan, HostKeyDecision, HostKeyVerifier,
@@ -20,6 +20,7 @@ struct ClientHandler {
     port: u16,
     verifier: Arc<dyn HostKeyVerifier>,
     forwarded_tcpip_sender: mpsc::Sender<PendingForwardedTcpip>,
+    forwarded_streamlocal_sender: mpsc::Sender<PendingForwardedStreamlocal>,
 }
 
 const FORWARDED_TCPIP_QUEUE_CAPACITY: usize = 64;
@@ -90,6 +91,21 @@ impl Handler for ClientHandler {
             .await
             .map_err(|_| SshError::channel("forwarded-tcpip channel receiver is closed"))
     }
+
+    async fn server_channel_open_forwarded_streamlocal(
+        &mut self,
+        channel: russh::Channel<russh::client::Msg>,
+        socket_path: &str,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        self.forwarded_streamlocal_sender
+            .send(PendingForwardedStreamlocal {
+                channel,
+                socket_path: socket_path.to_owned(),
+            })
+            .await
+            .map_err(|_| SshError::channel("forwarded-streamlocal channel receiver is closed"))
+    }
 }
 
 /// An authenticated SSH transport session.
@@ -98,6 +114,7 @@ pub struct SshSession {
     config: SshConfig,
     operation_context: OperationContext,
     forwarded_tcpip_receiver: Mutex<mpsc::Receiver<PendingForwardedTcpip>>,
+    forwarded_streamlocal_receiver: Mutex<mpsc::Receiver<PendingForwardedStreamlocal>>,
 }
 
 impl SshSession {
@@ -126,11 +143,14 @@ impl SshSession {
         let port = config.port;
         let (forwarded_tcpip_sender, forwarded_tcpip_receiver) =
             mpsc::channel(FORWARDED_TCPIP_QUEUE_CAPACITY);
+        let (forwarded_streamlocal_sender, forwarded_streamlocal_receiver) =
+            mpsc::channel(FORWARDED_TCPIP_QUEUE_CAPACITY);
         let handler = ClientHandler {
             host: host.clone(),
             port,
             verifier: Arc::new(verifier),
             forwarded_tcpip_sender,
+            forwarded_streamlocal_sender,
         };
         let client_config = client::Config {
             keepalive_interval: config.keepalive_interval,
@@ -168,6 +188,7 @@ impl SshSession {
             operation_context: context,
             config,
             forwarded_tcpip_receiver: Mutex::new(forwarded_tcpip_receiver),
+            forwarded_streamlocal_receiver: Mutex::new(forwarded_streamlocal_receiver),
         })
     }
 
@@ -208,11 +229,14 @@ impl SshSession {
         let port = config.port;
         let (forwarded_tcpip_sender, forwarded_tcpip_receiver) =
             mpsc::channel(FORWARDED_TCPIP_QUEUE_CAPACITY);
+        let (forwarded_streamlocal_sender, forwarded_streamlocal_receiver) =
+            mpsc::channel(FORWARDED_TCPIP_QUEUE_CAPACITY);
         let handler = ClientHandler {
             host: host.clone(),
             port,
             verifier: Arc::new(verifier),
             forwarded_tcpip_sender,
+            forwarded_streamlocal_sender,
         };
         let client_config = client::Config {
             keepalive_interval: config.keepalive_interval,
@@ -261,6 +285,7 @@ impl SshSession {
             operation_context: context,
             config,
             forwarded_tcpip_receiver: Mutex::new(forwarded_tcpip_receiver),
+            forwarded_streamlocal_receiver: Mutex::new(forwarded_streamlocal_receiver),
         })
     }
 
@@ -345,6 +370,23 @@ impl SshSession {
             .await
     }
 
+    pub(crate) async fn open_raw_direct_streamlocal_with_context(
+        &self,
+        socket_path: String,
+        context: &OperationContext,
+    ) -> Result<russh::Channel<russh::client::Msg>, SshError> {
+        context
+            .run("open direct-streamlocal channel", async {
+                self.handle
+                    .channel_open_direct_streamlocal(socket_path)
+                    .await
+                    .map_err(|error| {
+                        SshError::from_source(crate::ErrorKind::Channel, error.to_string(), error)
+                    })
+            })
+            .await
+    }
+
     pub(crate) async fn request_raw_tcpip_forward_with_context(
         &mut self,
         address: String,
@@ -381,6 +423,40 @@ impl SshSession {
             .await
     }
 
+    pub(crate) async fn request_raw_streamlocal_forward_with_context(
+        &mut self,
+        socket_path: String,
+        context: &OperationContext,
+    ) -> Result<(), SshError> {
+        context
+            .run("request remote streamlocal forward", async move {
+                self.handle
+                    .streamlocal_forward(socket_path)
+                    .await
+                    .map_err(|error| {
+                        SshError::from_source(crate::ErrorKind::Channel, error.to_string(), error)
+                    })
+            })
+            .await
+    }
+
+    pub(crate) async fn cancel_raw_streamlocal_forward_with_context(
+        &mut self,
+        socket_path: String,
+        context: &OperationContext,
+    ) -> Result<(), SshError> {
+        context
+            .run("cancel remote streamlocal forward", async move {
+                self.handle
+                    .cancel_streamlocal_forward(socket_path)
+                    .await
+                    .map_err(|error| {
+                        SshError::from_source(crate::ErrorKind::Channel, error.to_string(), error)
+                    })
+            })
+            .await
+    }
+
     pub(crate) async fn next_raw_forwarded_tcpip_with_context(
         &self,
         context: &OperationContext,
@@ -388,6 +464,18 @@ impl SshSession {
         context
             .run("wait for forwarded-tcpip channel", async {
                 let mut receiver = self.forwarded_tcpip_receiver.lock().await;
+                Ok(receiver.recv().await)
+            })
+            .await
+    }
+
+    pub(crate) async fn next_raw_forwarded_streamlocal_with_context(
+        &self,
+        context: &OperationContext,
+    ) -> Result<Option<PendingForwardedStreamlocal>, SshError> {
+        context
+            .run("wait for forwarded-streamlocal channel", async {
+                let mut receiver = self.forwarded_streamlocal_receiver.lock().await;
                 Ok(receiver.recv().await)
             })
             .await
@@ -884,6 +972,40 @@ Vv9WFaQHofuFcUUAAAAaeHNzaC1ydXN0LWxpYiB0ZXN0IGZpeHR1cmUB
         }
     }
 
+    #[cfg(unix)]
+    struct DirectStreamlocalServer;
+
+    #[cfg(unix)]
+    impl server::Handler for DirectStreamlocalServer {
+        type Error = russh::Error;
+
+        async fn auth_password(
+            &mut self,
+            _user: &str,
+            password: &str,
+        ) -> Result<Auth, Self::Error> {
+            if password == "test-password" {
+                Ok(Auth::Accept)
+            } else {
+                Ok(Auth::reject())
+            }
+        }
+
+        async fn channel_open_direct_streamlocal(
+            &mut self,
+            channel: russh::Channel<russh::server::Msg>,
+            socket_path: &str,
+            _session: &mut server::Session,
+        ) -> Result<bool, Self::Error> {
+            let mut target = tokio::net::UnixStream::connect(socket_path).await?;
+            let mut channel_stream = channel.into_stream();
+            tokio::spawn(async move {
+                let _ = tokio::io::copy_bidirectional(&mut channel_stream, &mut target).await;
+            });
+            Ok(true)
+        }
+    }
+
     struct JumpServer;
 
     impl server::Handler for JumpServer {
@@ -971,6 +1093,40 @@ Vv9WFaQHofuFcUUAAAAaeHNzaC1ydXN0LWxpYiB0ZXN0IGZpeHR1cmUB
             &mut self,
             _address: &str,
             _port: u32,
+            _session: &mut server::Session,
+        ) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+
+        async fn streamlocal_forward(
+            &mut self,
+            socket_path: &str,
+            session: &mut server::Session,
+        ) -> Result<bool, Self::Error> {
+            if socket_path != "/tmp/xssh-rust-lib-remote.sock" {
+                return Ok(false);
+            }
+            let handle = session.handle();
+            let socket_path = socket_path.to_owned();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                let channel = handle
+                    .channel_open_forwarded_streamlocal(socket_path)
+                    .await
+                    .unwrap();
+                let channel_id = channel.id();
+                handle
+                    .data(channel_id, CryptoVec::from(b"remote unix hello".to_vec()))
+                    .await
+                    .unwrap();
+                handle.eof(channel_id).await.unwrap();
+            });
+            Ok(true)
+        }
+
+        async fn cancel_streamlocal_forward(
+            &mut self,
+            _socket_path: &str,
             _session: &mut server::Session,
         ) -> Result<bool, Self::Error> {
             Ok(true)
@@ -1140,6 +1296,57 @@ Vv9WFaQHofuFcUUAAAAaeHNzaC1ydXN0LWxpYiB0ZXN0IGZpeHR1cmUB
         let read = stream.read(&mut buffer).await.unwrap();
         assert_eq!(&buffer[..read], b"hello through ssh\n");
         session.disconnect().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn direct_streamlocal_channel_round_trips_data() {
+        let socket_path = format!(
+            "/tmp/xssh-rust-lib-direct-streamlocal-{}",
+            std::process::id()
+        );
+        let _ = std::fs::remove_file(&socket_path);
+        let unix_listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        tokio::spawn(async move {
+            let (socket, _) = unix_listener.accept().await.unwrap();
+            let (mut reader, mut writer) = socket.into_split();
+            let _ = tokio::io::copy(&mut reader, &mut writer).await;
+        });
+
+        let server_key = PrivateKey::random(
+            &mut russh::keys::ssh_key::rand_core::OsRng,
+            Algorithm::Ed25519,
+        )
+        .unwrap();
+        let mut server_config = server::Config::default();
+        server_config.keys.push(server_key.clone());
+        let server_config = Arc::new(server_config);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            server::run_stream(server_config, socket, DirectStreamlocalServer)
+                .await
+                .unwrap();
+        });
+
+        let mut verifier = KnownHostKeyVerifier::new();
+        verifier.insert_key("127.0.0.1", address.port(), server_key.public_key());
+        let mut config = SshConfig::new("127.0.0.1", "alice").unwrap();
+        config.port = address.port();
+        config.connect_timeout = Duration::from_secs(5);
+        let session = SshSession::connect(config, verifier, AuthMethod::password("test-password"))
+            .await
+            .unwrap();
+        let channel = session.open_direct_streamlocal(&socket_path).await.unwrap();
+        let mut stream = channel.into_stream();
+        stream.write(b"hello through unix ssh\n").await.unwrap();
+        let mut buffer = [0_u8; 23];
+        let read = stream.read(&mut buffer).await.unwrap();
+        assert_eq!(&buffer[..read], b"hello through unix ssh\n");
+        session.disconnect().await.unwrap();
+        let _ = std::fs::remove_file(socket_path);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1330,6 +1537,25 @@ Vv9WFaQHofuFcUUAAAAaeHNzaC1ydXN0LWxpYiB0ZXN0IGZpeHR1cmUB
         assert_eq!(&buffer[..read], b"remote hello");
 
         session.cancel_remote_tcpip_forward(&forward).await.unwrap();
+
+        let streamlocal_forward = session
+            .request_remote_streamlocal_forward("/tmp/xssh-rust-lib-remote.sock")
+            .await
+            .unwrap();
+        assert_eq!(
+            streamlocal_forward.socket_path(),
+            "/tmp/xssh-rust-lib-remote.sock"
+        );
+        let incoming = session.next_forwarded_streamlocal().await.unwrap().unwrap();
+        assert_eq!(incoming.socket_path(), "/tmp/xssh-rust-lib-remote.sock");
+        let mut stream = incoming.into_stream();
+        let mut buffer = [0_u8; 17];
+        let read = stream.read(&mut buffer).await.unwrap();
+        assert_eq!(&buffer[..read], b"remote unix hello");
+        session
+            .cancel_remote_streamlocal_forward(&streamlocal_forward)
+            .await
+            .unwrap();
         session.disconnect().await.unwrap();
     }
 
@@ -1352,11 +1578,14 @@ Vv9WFaQHofuFcUUAAAAaeHNzaC1ydXN0LWxpYiB0ZXN0IGZpeHR1cmUB
         let mut verifier = KnownHostKeyVerifier::new();
         verifier.insert_key("server.example.com", 22, &expected_key);
         let (forwarded_tcpip_sender, _forwarded_tcpip_receiver) = tokio::sync::mpsc::channel(1);
+        let (forwarded_streamlocal_sender, _forwarded_streamlocal_receiver) =
+            tokio::sync::mpsc::channel(1);
         let mut handler = ClientHandler {
             host: "server.example.com".to_owned(),
             port: 22,
             verifier: Arc::new(verifier),
             forwarded_tcpip_sender,
+            forwarded_streamlocal_sender,
         };
 
         let error = handler.check_server_key(&presented_key).await.unwrap_err();

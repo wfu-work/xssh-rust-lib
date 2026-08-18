@@ -18,6 +18,7 @@ pub use core::{
     KeyboardInteractiveHandler, KeyboardInteractivePrompt, KnownHostEntry, KnownHostKeyVerifier,
     KnownHostMarker, KnownHosts, OperationContext, PrivateKey, PublicKey, RsaHashAlgorithm,
     SecretString, ServerAuthMethod, Socks5Authentication, Socks5Proxy, Socks5ProxyOptions,
-    SshChannel, SshChannelEvent, SshChannelStream, SshConfig, SshError, SshForwardedTcpipChannel,
+    SshChannel, SshChannelEvent, SshChannelStream, SshConfig, SshError,
+    SshForwardedStreamlocalChannel, SshForwardedTcpipChannel, SshRemoteStreamlocalForward,
     SshRemoteTcpipForward, SshSession, TofuHostKeyVerifier,
 };
