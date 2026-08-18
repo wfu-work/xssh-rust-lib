@@ -13,7 +13,7 @@ use tokio::net::UnixListener;
 use tokio::net::{TcpListener, ToSocketAddrs};
 use tokio::sync::Semaphore;
 
-use crate::{CancellationToken, ErrorKind, OperationContext, SshError, SshSession};
+use crate::{CancellationToken, ErrorKind, OperationContext, SshChannel, SshError, SshSession};
 
 /// The SSH endpoint selected for each accepted local relay connection.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -61,6 +61,25 @@ impl ForwardingTarget {
             Self::Streamlocal { socket_path } => validate_socket_path(socket_path)?,
         }
         Ok(())
+    }
+
+    async fn open_channel(
+        &self,
+        session: &SshSession,
+        context: &OperationContext,
+    ) -> Result<SshChannel, SshError> {
+        match self {
+            Self::Tcp { host, port } => {
+                session
+                    .open_direct_tcpip_with_context(host.clone(), *port, context)
+                    .await
+            }
+            Self::Streamlocal { socket_path } => {
+                session
+                    .open_direct_streamlocal_with_context(socket_path.clone(), context)
+                    .await
+            }
+        }
     }
 }
 
@@ -197,15 +216,44 @@ impl RelayStats {
             elapsed: self.started_at.elapsed(),
         }
     }
+
+    fn record_accepted(&self) {
+        self.accepted_connections.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_rejected(&self) {
+        self.rejected_connections.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn start_connection(self: &Arc<Self>) -> ActiveConnectionGuard {
+        self.active_connections.fetch_add(1, Ordering::Relaxed);
+        ActiveConnectionGuard {
+            stats: Arc::clone(self),
+        }
+    }
+
+    fn record_completed(&self, result: &Result<(), SshError>) {
+        self.completed_connections.fetch_add(1, Ordering::Relaxed);
+        if result
+            .as_ref()
+            .is_err_and(|error| error.kind() != crate::ErrorKind::Cancelled)
+        {
+            self.failed_connections.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn record_read(&self, direction: CounterDirection, bytes: usize) {
+        let counter = match direction {
+            CounterDirection::LocalToRemote => &self.bytes_local_to_remote,
+            CounterDirection::RemoteToLocal => &self.bytes_remote_to_local,
+        };
+        counter.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
 }
 
 /// A reusable local listener and SSH relay manager.
 pub struct SshForwardingRelay {
-    listener: RelayListener,
-    session: Arc<SshSession>,
-    target: ForwardingTarget,
-    options: ForwardingRelayOptions,
-    stats: Arc<RelayStats>,
+    runtime: RelayRuntime,
 }
 
 impl SshForwardingRelay {
@@ -218,8 +266,7 @@ impl SshForwardingRelay {
     where
         A: ToSocketAddrs,
     {
-        options.validate()?;
-        target.validate()?;
+        validate_relay_inputs(&target, &options)?;
         let listener = TcpListener::bind(address).await.map_err(|error| {
             SshError::from_source(
                 ErrorKind::Connection,
@@ -236,14 +283,8 @@ impl SshForwardingRelay {
         target: ForwardingTarget,
         options: ForwardingRelayOptions,
     ) -> Result<Self, SshError> {
-        options.validate()?;
-        target.validate()?;
         Ok(Self {
-            listener: RelayListener::Tcp(listener),
-            session,
-            target,
-            options,
-            stats: Arc::new(RelayStats::new()),
+            runtime: RelayRuntime::new(RelayListener::Tcp(listener), session, target, options)?,
         })
     }
 
@@ -254,8 +295,7 @@ impl SshForwardingRelay {
         target: ForwardingTarget,
         options: ForwardingRelayOptions,
     ) -> Result<Self, SshError> {
-        options.validate()?;
-        target.validate()?;
+        validate_relay_inputs(&target, &options)?;
         let path = path.as_ref().to_path_buf();
         let listener = UnixListener::bind(&path).map_err(|error| {
             SshError::from_source(
@@ -275,51 +315,35 @@ impl SshForwardingRelay {
         target: ForwardingTarget,
         options: ForwardingRelayOptions,
     ) -> Result<Self, SshError> {
-        options.validate()?;
-        target.validate()?;
         Ok(Self {
-            listener: RelayListener::Unix { listener, path },
-            session,
-            target,
-            options,
-            stats: Arc::new(RelayStats::new()),
+            runtime: RelayRuntime::new(
+                RelayListener::Unix { listener, path },
+                session,
+                target,
+                options,
+            )?,
         })
     }
 
     pub fn target(&self) -> &ForwardingTarget {
-        &self.target
+        self.runtime.target()
     }
 
     pub fn options(&self) -> &ForwardingRelayOptions {
-        &self.options
+        self.runtime.options()
     }
 
     pub fn stats(&self) -> ForwardingRelayStatsSnapshot {
-        self.stats.snapshot()
+        self.runtime.stats()
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr, SshError> {
-        match &self.listener {
-            RelayListener::Tcp(listener) => listener.local_addr().map_err(|error| {
-                SshError::from_source(
-                    ErrorKind::Connection,
-                    "failed to inspect forwarding listener address",
-                    error,
-                )
-            }),
-            #[cfg(unix)]
-            RelayListener::Unix { .. } => Err(SshError::configuration(
-                "Unix forwarding listener does not have an IP socket address",
-            )),
-        }
+        self.runtime.local_addr()
     }
 
     #[cfg(unix)]
     pub fn local_unix_path(&self) -> Option<&Path> {
-        match &self.listener {
-            RelayListener::Tcp(_) => None,
-            RelayListener::Unix { path, .. } => Some(path),
-        }
+        self.runtime.local_unix_path()
     }
 
     pub async fn run(&self, cancellation: CancellationToken) -> Result<(), SshError> {
@@ -328,59 +352,101 @@ impl SshForwardingRelay {
     }
 
     pub async fn run_with_context(&self, context: &OperationContext) -> Result<(), SshError> {
+        self.runtime.run(context).await
+    }
+}
+
+struct RelayRuntime {
+    listener: RelayListener,
+    session: Arc<SshSession>,
+    target: ForwardingTarget,
+    options: ForwardingRelayOptions,
+    stats: Arc<RelayStats>,
+}
+
+impl RelayRuntime {
+    fn new(
+        listener: RelayListener,
+        session: Arc<SshSession>,
+        target: ForwardingTarget,
+        options: ForwardingRelayOptions,
+    ) -> Result<Self, SshError> {
+        validate_relay_inputs(&target, &options)?;
+        Ok(Self {
+            listener,
+            session,
+            target,
+            options,
+            stats: Arc::new(RelayStats::new()),
+        })
+    }
+
+    fn target(&self) -> &ForwardingTarget {
+        &self.target
+    }
+
+    fn options(&self) -> &ForwardingRelayOptions {
+        &self.options
+    }
+
+    fn stats(&self) -> ForwardingRelayStatsSnapshot {
+        self.stats.snapshot()
+    }
+
+    fn local_addr(&self) -> Result<SocketAddr, SshError> {
+        self.listener.local_addr()
+    }
+
+    #[cfg(unix)]
+    fn local_unix_path(&self) -> Option<&Path> {
+        self.listener.local_unix_path()
+    }
+
+    async fn run(&self, context: &OperationContext) -> Result<(), SshError> {
         let permits = Arc::new(Semaphore::new(self.options.max_connections));
         loop {
             let (stream, peer_ip) = context
                 .run("accept forwarding relay connection", self.listener.accept())
                 .await?;
-            self.stats
-                .accepted_connections
-                .fetch_add(1, Ordering::Relaxed);
-
-            if !self.options.access_policy.allows(peer_ip) {
-                self.stats
-                    .rejected_connections
-                    .fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
-
-            let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
-                self.stats
-                    .rejected_connections
-                    .fetch_add(1, Ordering::Relaxed);
-                continue;
-            };
-            self.stats
-                .active_connections
-                .fetch_add(1, Ordering::Relaxed);
-            let session = Arc::clone(&self.session);
-            let target = self.target.clone();
-            let options = self.options.clone();
-            let stats = Arc::clone(&self.stats);
-            let connection_context = context.clone();
-            tokio::spawn(async move {
-                let _permit = permit;
-                let _active = ActiveConnectionGuard {
-                    stats: Arc::clone(&stats),
-                };
-                let result = relay_connection(
-                    stream,
-                    session,
-                    target,
-                    options,
-                    &connection_context,
-                    Arc::clone(&stats),
-                )
-                .await;
-                stats.completed_connections.fetch_add(1, Ordering::Relaxed);
-                if result
-                    .as_ref()
-                    .is_err_and(|error| error.kind() != crate::ErrorKind::Cancelled)
-                {
-                    stats.failed_connections.fetch_add(1, Ordering::Relaxed);
-                }
-            });
+            self.dispatch(stream, peer_ip, context, &permits);
         }
+    }
+
+    fn dispatch(
+        &self,
+        stream: BoxedRelayIo,
+        peer_ip: Option<IpAddr>,
+        context: &OperationContext,
+        permits: &Arc<Semaphore>,
+    ) {
+        self.stats.record_accepted();
+        if !self.options.access_policy.allows(peer_ip) {
+            self.stats.record_rejected();
+            return;
+        }
+
+        let Ok(permit) = Arc::clone(permits).try_acquire_owned() else {
+            self.stats.record_rejected();
+            return;
+        };
+
+        let connection = RelayConnection::new(
+            stream,
+            Arc::clone(&self.session),
+            self.target.clone(),
+            self.options.clone(),
+            context.clone(),
+            Arc::clone(&self.stats),
+        );
+        tokio::spawn(async move {
+            let _permit = permit;
+            let stats = Arc::clone(&connection.stats);
+            let result = {
+                let _active = stats.start_connection();
+                connection.run().await
+            };
+            stats.record_completed(&result);
+        });
     }
 }
 
@@ -406,6 +472,30 @@ enum RelayListener {
 }
 
 impl RelayListener {
+    fn local_addr(&self) -> Result<SocketAddr, SshError> {
+        match self {
+            Self::Tcp(listener) => listener.local_addr().map_err(|error| {
+                SshError::from_source(
+                    ErrorKind::Connection,
+                    "failed to inspect forwarding listener address",
+                    error,
+                )
+            }),
+            #[cfg(unix)]
+            Self::Unix { .. } => Err(SshError::configuration(
+                "Unix forwarding listener does not have an IP socket address",
+            )),
+        }
+    }
+
+    #[cfg(unix)]
+    fn local_unix_path(&self) -> Option<&Path> {
+        match self {
+            Self::Tcp(_) => None,
+            Self::Unix { path, .. } => Some(path),
+        }
+    }
+
     async fn accept(&self) -> Result<(BoxedRelayIo, Option<IpAddr>), SshError> {
         match self {
             Self::Tcp(listener) => {
@@ -439,53 +529,71 @@ impl<T> RelayIo for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 
 type BoxedRelayIo = Box<dyn RelayIo>;
 
-async fn relay_connection(
+struct RelayConnection {
     local: BoxedRelayIo,
     session: Arc<SshSession>,
     target: ForwardingTarget,
     options: ForwardingRelayOptions,
-    context: &OperationContext,
+    context: OperationContext,
     stats: Arc<RelayStats>,
-) -> Result<(), SshError> {
-    let open_context = context
-        .clone()
-        .with_timeout_from_now(options.connection_timeout);
-    let channel = match target {
-        ForwardingTarget::Tcp { host, port } => {
-            session
-                .open_direct_tcpip_with_context(host, port, &open_context)
-                .await?
+}
+
+impl RelayConnection {
+    fn new(
+        local: BoxedRelayIo,
+        session: Arc<SshSession>,
+        target: ForwardingTarget,
+        options: ForwardingRelayOptions,
+        context: OperationContext,
+        stats: Arc<RelayStats>,
+    ) -> Self {
+        Self {
+            local,
+            session,
+            target,
+            options,
+            context,
+            stats,
         }
-        ForwardingTarget::Streamlocal { socket_path } => {
-            session
-                .open_direct_streamlocal_with_context(socket_path, &open_context)
-                .await?
-        }
-    };
-    let remote = channel.into_stream();
-    let mut local = CountingStream::local(local, Arc::clone(&stats));
-    let mut remote = CountingStream::remote(remote, Arc::clone(&stats));
-    let cancellation = context.cancellation_token();
-    context
-        .run("relay forwarding connection", async {
-            tokio::select! {
-                _ = cancellation.cancelled() => {
-                    let _ = local.shutdown().await;
-                    let _ = remote.shutdown().await;
-                    Err(SshError::cancelled("forwarding relay was cancelled"))
+    }
+
+    async fn run(self) -> Result<(), SshError> {
+        let open_context = self
+            .context
+            .clone()
+            .with_timeout_from_now(self.options.connection_timeout);
+        let channel = self
+            .target
+            .open_channel(&self.session, &open_context)
+            .await?;
+        self.relay_streams(channel).await
+    }
+
+    async fn relay_streams(self, channel: SshChannel) -> Result<(), SshError> {
+        let mut local = CountingStream::local(self.local, Arc::clone(&self.stats));
+        let mut remote = CountingStream::remote(channel.into_stream(), Arc::clone(&self.stats));
+        let cancellation = self.context.cancellation_token();
+        self.context
+            .run("relay forwarding connection", async {
+                tokio::select! {
+                    _ = cancellation.cancelled() => {
+                        let _ = local.shutdown().await;
+                        let _ = remote.shutdown().await;
+                        Err(SshError::cancelled("forwarding relay was cancelled"))
+                    }
+                    result = tokio::io::copy_bidirectional(&mut local, &mut remote) => {
+                        result
+                            .map(|_| ())
+                            .map_err(|error| SshError::from_source(
+                                ErrorKind::Channel,
+                                "forwarding relay failed",
+                                error,
+                            ))
+                    }
                 }
-                result = tokio::io::copy_bidirectional(&mut local, &mut remote) => {
-                    result
-                        .map(|_| ())
-                        .map_err(|error| SshError::from_source(
-                            ErrorKind::Channel,
-                            "forwarding relay failed",
-                            error,
-                        ))
-                }
-            }
-        })
-        .await
+            })
+            .await
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -518,17 +626,7 @@ impl<S> CountingStream<S> {
     }
 
     fn add_bytes(&self, direction: &CounterDirection, bytes: usize) {
-        let bytes = bytes as u64;
-        match direction {
-            CounterDirection::LocalToRemote => self
-                .stats
-                .bytes_local_to_remote
-                .fetch_add(bytes, Ordering::Relaxed),
-            CounterDirection::RemoteToLocal => self
-                .stats
-                .bytes_remote_to_local
-                .fetch_add(bytes, Ordering::Relaxed),
-        };
+        self.stats.record_read(*direction, bytes);
     }
 }
 
@@ -590,6 +688,14 @@ fn validate_socket_path(socket_path: &str) -> Result<(), SshError> {
         ));
     }
     Ok(())
+}
+
+fn validate_relay_inputs(
+    target: &ForwardingTarget,
+    options: &ForwardingRelayOptions,
+) -> Result<(), SshError> {
+    options.validate()?;
+    target.validate()
 }
 
 #[cfg(test)]
