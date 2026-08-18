@@ -659,13 +659,14 @@ mod tests {
     use russh::keys::{Algorithm, PrivateKey, PublicKey};
     use russh::server::{self, Auth, Response};
     use russh::{ChannelMsg, CryptoVec};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
     use super::{ClientHandler, SshSession};
     use crate::{
-        AuthMethod, AuthMethodKind, AuthenticationPlan, ErrorKind, HostKeyDecision,
-        HostKeyVerifier, KnownHostKeyVerifier, RsaHashAlgorithm, SecretString, ServerAuthMethod,
-        SshConfig, SshError, TofuHostKeyVerifier,
+        AuthMethod, AuthMethodKind, AuthenticationPlan, CancellationToken, ErrorKind,
+        HostKeyDecision, HostKeyVerifier, KnownHostKeyVerifier, RsaHashAlgorithm, SecretString,
+        ServerAuthMethod, Socks5Proxy, SshConfig, SshError, TofuHostKeyVerifier,
     };
 
     const TEST_RSA_PRIVATE_KEY: &str = r#"-----BEGIN OPENSSH PRIVATE KEY-----
@@ -985,6 +986,69 @@ Vv9WFaQHofuFcUUAAAAaeHNzaC1ydXN0LWxpYiB0ZXN0IGZpeHR1cmUB
         let mut buffer = [0_u8; 18];
         let read = stream.read(&mut buffer).await.unwrap();
         assert_eq!(&buffer[..read], b"hello through ssh\n");
+        session.disconnect().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn socks5_proxy_relays_a_connect_request_over_ssh() {
+        let server_key = PrivateKey::random(
+            &mut russh::keys::ssh_key::rand_core::OsRng,
+            Algorithm::Ed25519,
+        )
+        .unwrap();
+        let mut server_config = server::Config::default();
+        server_config.keys.push(server_key.clone());
+        let server_config = Arc::new(server_config);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            server::run_stream(server_config, socket, DirectTcpipServer)
+                .await
+                .unwrap();
+        });
+
+        let mut verifier = KnownHostKeyVerifier::new();
+        verifier.insert_key("127.0.0.1", address.port(), server_key.public_key());
+        let mut config = SshConfig::new("127.0.0.1", "alice").unwrap();
+        config.port = address.port();
+        config.connect_timeout = Duration::from_secs(5);
+        let session = Arc::new(
+            SshSession::connect(config, verifier, AuthMethod::password("test-password"))
+                .await
+                .unwrap(),
+        );
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = Socks5Proxy::from_listener(Arc::clone(&session), proxy_listener);
+        let proxy_address = proxy.local_addr().unwrap();
+        let cancellation = CancellationToken::new();
+        let proxy_cancellation = cancellation.clone();
+        let proxy_task = tokio::spawn(async move { proxy.run(proxy_cancellation).await });
+
+        let mut client = tokio::net::TcpStream::connect(proxy_address).await.unwrap();
+        client.write_all(&[5, 1, 0]).await.unwrap();
+        let mut method = [0_u8; 2];
+        client.read_exact(&mut method).await.unwrap();
+        assert_eq!(method, [5, 0]);
+        client.write_all(&[5, 1, 0, 3, 13]).await.unwrap();
+        client.write_all(b"echo.internal").await.unwrap();
+        client.write_all(&7_u16.to_be_bytes()).await.unwrap();
+
+        let mut reply = [0_u8; 10];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply[..2], &[5, 0]);
+        client.write_all(b"through socks5").await.unwrap();
+        let mut echoed = [0_u8; 14];
+        client.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, b"through socks5");
+
+        cancellation.cancel();
+        assert_eq!(
+            proxy_task.await.unwrap().unwrap_err().kind(),
+            ErrorKind::Cancelled
+        );
         session.disconnect().await.unwrap();
     }
 

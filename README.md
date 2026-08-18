@@ -296,6 +296,52 @@ session.cancel_remote_tcpip_forward(&forward).await?;
 会使用服务端分配的实际端口；服务端返回非法端口或动态端口缺失会报告
 `ErrorKind::Protocol`。
 
+## SOCKS5 动态代理
+
+`Socks5Proxy` 在本地监听 SOCKS5 客户端，把每个 `CONNECT` 请求转换为 SSH
+`direct-tcpip` channel，再执行双向字节 relay。支持 IPv4、IPv6 和域名目标；域名不会在
+本地解析，而是原样交给 SSH 服务端，因此目标可访问服务端所在网络中的内网地址：
+
+```rust,no_run
+use std::sync::Arc;
+use xssh_rust_lib::{CancellationToken, Socks5Proxy, SshSession};
+
+# async fn run(session: SshSession) -> Result<(), Box<dyn std::error::Error>> {
+let session = Arc::new(session);
+let proxy = Socks5Proxy::bind(Arc::clone(&session), "127.0.0.1:1080").await?;
+let cancellation = CancellationToken::new();
+
+// 在关闭窗口或应用退出时调用 cancellation.cancel()。
+proxy.run(cancellation).await?;
+# Ok(())
+# }
+```
+
+默认只接受 SOCKS5 no-auth 方法。需要认证时显式配置用户名密码、并设置合理的并发上限和
+握手超时：
+
+```rust,no_run
+use std::sync::Arc;
+use std::time::Duration;
+use xssh_rust_lib::{
+    Socks5Authentication, Socks5Proxy, Socks5ProxyOptions, SshSession,
+};
+
+# async fn run(session: SshSession) -> Result<(), Box<dyn std::error::Error>> {
+let options = Socks5ProxyOptions {
+    max_connections: 64,
+    handshake_timeout: Duration::from_secs(15),
+    authentication: Socks5Authentication::username_password("alice", "local-secret"),
+};
+let proxy = Socks5Proxy::bind_with_options(Arc::new(session), "127.0.0.1:0", options).await?;
+println!("SOCKS5 listening on {}", proxy.local_addr()?);
+# Ok(())
+# }
+```
+
+代理默认不会暴露到公网；如果确实需要监听非回环地址，应同时启用用户名密码认证、系统
+防火墙和访问控制。代理只实现 `CONNECT`，不支持 `BIND`、UDP ASSOCIATE 或代理链。
+
 ## 使用示例
 
 ```rust,no_run
@@ -353,7 +399,8 @@ sftp.close().await?;
 
 ## 当前未包含
 
-GPUI UI、VT100 渲染、SQLite、Keychain、Windows Credential Manager、SOCKS 代理和代理链不属于当前基础库。
+GPUI UI、VT100 渲染、SQLite、Keychain、Windows Credential Manager、Unix socket forwarding
+和 SSH ProxyJump/代理链不属于当前基础库。
 
 ## 开发检查
 
