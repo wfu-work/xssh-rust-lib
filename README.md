@@ -260,6 +260,42 @@ loop {
 `OperationContext` 的截止时间和取消信号，channel stream 的 `read`、`write`、`flush`
 也会沿用同一套操作超时策略。
 
+远程反向转发使用 `request_remote_tcpip_forward` 注册服务端监听，再通过
+`next_forwarded_tcpip` 消费每个进入的连接。远端 channel 队列容量固定为 64，消费速度不足
+时会对 SSH handler 施加背压；上层应尽快把 channel 转交给 relay 任务：
+
+```rust,no_run
+use xssh_rust_lib::SshSession;
+
+# async fn run(session: &mut SshSession) -> Result<(), Box<dyn std::error::Error>> {
+let forward = session
+    .request_remote_tcpip_forward("127.0.0.1", 0)
+    .await?;
+println!("remote listener: {}:{}", forward.address(), forward.port());
+
+while let Some(incoming) = session.next_forwarded_tcpip().await? {
+    println!(
+        "incoming connection from {}:{}",
+        incoming.originator_address(),
+        incoming.originator_port()
+    );
+    let mut stream = incoming.into_stream();
+    tokio::spawn(async move {
+        // Connect a local socket and relay with copy_bidirectional here.
+        let _ = stream.flush().await;
+    });
+}
+
+session.cancel_remote_tcpip_forward(&forward).await?;
+# Ok(())
+# }
+```
+
+`request_remote_tcpip_forward` 和取消操作需要独占 `&mut SshSession`，以保证 russh 全局请求
+的顺序；接收 channel 的 `next_forwarded_tcpip` 可以通过共享引用调用。端口为零时，返回值
+会使用服务端分配的实际端口；服务端返回非法端口或动态端口缺失会报告
+`ErrorKind::Protocol`。
+
 ## 使用示例
 
 ```rust,no_run
@@ -317,7 +353,7 @@ sftp.close().await?;
 
 ## 当前未包含
 
-GPUI UI、VT100 渲染、SQLite、Keychain、Windows Credential Manager、远程反向转发和代理链不属于当前基础库。
+GPUI UI、VT100 渲染、SQLite、Keychain、Windows Credential Manager、SOCKS 代理和代理链不属于当前基础库。
 
 ## 开发检查
 

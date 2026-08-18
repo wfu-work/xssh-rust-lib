@@ -96,6 +96,14 @@ impl SshError {
         Self::new(ErrorKind::Authentication, message)
     }
 
+    pub(crate) fn protocol(message: impl Into<String>) -> Self {
+        Self::new(ErrorKind::Protocol, message)
+    }
+
+    pub(crate) fn channel(message: impl Into<String>) -> Self {
+        Self::new(ErrorKind::Channel, message)
+    }
+
     pub(crate) fn timeout(message: impl Into<String>) -> Self {
         Self::new(ErrorKind::Timeout, message)
     }

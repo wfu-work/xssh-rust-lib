@@ -13,7 +13,9 @@ pub use auth::{
     AuthenticationPlan, KeyboardInteractiveChallenge, KeyboardInteractiveHandler,
     KeyboardInteractivePrompt, RsaHashAlgorithm, SecretString, ServerAuthMethod,
 };
-pub use channel::{SshChannel, SshChannelEvent, SshChannelStream};
+pub use channel::{
+    SshChannel, SshChannelEvent, SshChannelStream, SshForwardedTcpipChannel, SshRemoteTcpipForward,
+};
 pub use config::SshConfig;
 pub use error::{ErrorContext, ErrorKind, SshError};
 pub use host_key::{

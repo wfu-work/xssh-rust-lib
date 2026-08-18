@@ -4,6 +4,9 @@ use russh::client::{self, AuthResult, Handler, KeyboardInteractiveAuthResponse};
 use russh::keys::agent::client::{AgentClient, AgentStream};
 use russh::keys::{Algorithm, HashAlg, PrivateKeyWithHashAlg, PublicKey};
 use russh::Disconnect;
+use tokio::sync::{mpsc, Mutex};
+
+use super::channel::PendingForwardedTcpip;
 
 use crate::{
     AuthMethod, AuthenticationObservation, AuthenticationPlan, HostKeyDecision, HostKeyVerifier,
@@ -15,7 +18,10 @@ struct ClientHandler {
     host: String,
     port: u16,
     verifier: Arc<dyn HostKeyVerifier>,
+    forwarded_tcpip_sender: mpsc::Sender<PendingForwardedTcpip>,
 }
+
+const FORWARDED_TCPIP_QUEUE_CAPACITY: usize = 64;
 
 impl Handler for ClientHandler {
     type Error = SshError;
@@ -62,6 +68,27 @@ impl Handler for ClientHandler {
             .with_host_key_observation(observation)),
         }
     }
+
+    async fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        channel: russh::Channel<russh::client::Msg>,
+        connected_address: &str,
+        connected_port: u32,
+        originator_address: &str,
+        originator_port: u32,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        self.forwarded_tcpip_sender
+            .send(PendingForwardedTcpip {
+                channel,
+                connected_address: connected_address.to_owned(),
+                connected_port,
+                originator_address: originator_address.to_owned(),
+                originator_port,
+            })
+            .await
+            .map_err(|_| SshError::channel("forwarded-tcpip channel receiver is closed"))
+    }
 }
 
 /// An authenticated SSH transport session.
@@ -69,6 +96,7 @@ pub struct SshSession {
     handle: client::Handle<ClientHandler>,
     config: SshConfig,
     operation_context: OperationContext,
+    forwarded_tcpip_receiver: Mutex<mpsc::Receiver<PendingForwardedTcpip>>,
 }
 
 impl SshSession {
@@ -95,10 +123,13 @@ impl SshSession {
         config.validate()?;
         let host = config.host.clone();
         let port = config.port;
+        let (forwarded_tcpip_sender, forwarded_tcpip_receiver) =
+            mpsc::channel(FORWARDED_TCPIP_QUEUE_CAPACITY);
         let handler = ClientHandler {
             host: host.clone(),
             port,
             verifier: Arc::new(verifier),
+            forwarded_tcpip_sender,
         };
         let client_config = client::Config {
             keepalive_interval: config.keepalive_interval,
@@ -135,6 +166,7 @@ impl SshSession {
             handle,
             operation_context: context,
             config,
+            forwarded_tcpip_receiver: Mutex::new(forwarded_tcpip_receiver),
         })
     }
 
@@ -215,6 +247,54 @@ impl SshSession {
                     .map_err(|error| {
                         SshError::from_source(crate::ErrorKind::Channel, error.to_string(), error)
                     })
+            })
+            .await
+    }
+
+    pub(crate) async fn request_raw_tcpip_forward_with_context(
+        &mut self,
+        address: String,
+        port: u16,
+        context: &OperationContext,
+    ) -> Result<u32, SshError> {
+        context
+            .run("request remote tcpip forward", async move {
+                self.handle
+                    .tcpip_forward(address, u32::from(port))
+                    .await
+                    .map_err(|error| {
+                        SshError::from_source(crate::ErrorKind::Channel, error.to_string(), error)
+                    })
+            })
+            .await
+    }
+
+    pub(crate) async fn cancel_raw_tcpip_forward_with_context(
+        &mut self,
+        address: String,
+        port: u16,
+        context: &OperationContext,
+    ) -> Result<(), SshError> {
+        context
+            .run("cancel remote tcpip forward", async move {
+                self.handle
+                    .cancel_tcpip_forward(address, u32::from(port))
+                    .await
+                    .map_err(|error| {
+                        SshError::from_source(crate::ErrorKind::Channel, error.to_string(), error)
+                    })
+            })
+            .await
+    }
+
+    pub(crate) async fn next_raw_forwarded_tcpip_with_context(
+        &self,
+        context: &OperationContext,
+    ) -> Result<Option<PendingForwardedTcpip>, SshError> {
+        context
+            .run("wait for forwarded-tcpip channel", async {
+                let mut receiver = self.forwarded_tcpip_receiver.lock().await;
+                Ok(receiver.recv().await)
             })
             .await
     }
@@ -688,6 +768,61 @@ Vv9WFaQHofuFcUUAAAAaeHNzaC1ydXN0LWxpYiB0ZXN0IGZpeHR1cmUB
         }
     }
 
+    struct RemoteForwardServer;
+
+    impl server::Handler for RemoteForwardServer {
+        type Error = russh::Error;
+
+        async fn auth_password(
+            &mut self,
+            _user: &str,
+            password: &str,
+        ) -> Result<Auth, Self::Error> {
+            if password == "test-password" {
+                Ok(Auth::Accept)
+            } else {
+                Ok(Auth::reject())
+            }
+        }
+
+        async fn tcpip_forward(
+            &mut self,
+            address: &str,
+            port: &mut u32,
+            session: &mut server::Session,
+        ) -> Result<bool, Self::Error> {
+            if address != "127.0.0.1" || *port != 0 {
+                return Ok(false);
+            }
+            *port = 4242;
+            let handle = session.handle();
+            let address = address.to_owned();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                let channel = handle
+                    .channel_open_forwarded_tcpip(address, 4242, "10.0.0.2", 50000)
+                    .await
+                    .unwrap();
+                let channel_id = channel.id();
+                handle
+                    .data(channel_id, CryptoVec::from(b"remote hello".to_vec()))
+                    .await
+                    .unwrap();
+                handle.eof(channel_id).await.unwrap();
+            });
+            Ok(true)
+        }
+
+        async fn cancel_tcpip_forward(
+            &mut self,
+            _address: &str,
+            _port: u32,
+            _session: &mut server::Session,
+        ) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+    }
+
     struct SlowPasswordServer;
 
     impl server::Handler for SlowPasswordServer {
@@ -853,6 +988,57 @@ Vv9WFaQHofuFcUUAAAAaeHNzaC1ydXN0LWxpYiB0ZXN0IGZpeHR1cmUB
         session.disconnect().await.unwrap();
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remote_tcpip_forward_receives_and_cancels_channels() {
+        let server_key = PrivateKey::random(
+            &mut russh::keys::ssh_key::rand_core::OsRng,
+            Algorithm::Ed25519,
+        )
+        .unwrap();
+        let mut server_config = server::Config::default();
+        server_config.keys.push(server_key.clone());
+        let server_config = Arc::new(server_config);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            server::run_stream(server_config, socket, RemoteForwardServer)
+                .await
+                .unwrap();
+        });
+
+        let mut verifier = KnownHostKeyVerifier::new();
+        verifier.insert_key("127.0.0.1", address.port(), server_key.public_key());
+        let mut config = SshConfig::new("127.0.0.1", "alice").unwrap();
+        config.port = address.port();
+        config.connect_timeout = Duration::from_secs(5);
+
+        let mut session =
+            SshSession::connect(config, verifier, AuthMethod::password("test-password"))
+                .await
+                .unwrap();
+        let forward = session
+            .request_remote_tcpip_forward("127.0.0.1", 0)
+            .await
+            .unwrap();
+        assert_eq!(forward.address(), "127.0.0.1");
+        assert_eq!(forward.port(), 4242);
+
+        let incoming = session.next_forwarded_tcpip().await.unwrap().unwrap();
+        assert_eq!(incoming.connected_address(), "127.0.0.1");
+        assert_eq!(incoming.connected_port(), 4242);
+        assert_eq!(incoming.originator_address(), "10.0.0.2");
+        assert_eq!(incoming.originator_port(), 50000);
+        let mut stream = incoming.into_stream();
+        let mut buffer = [0_u8; 12];
+        let read = stream.read(&mut buffer).await.unwrap();
+        assert_eq!(&buffer[..read], b"remote hello");
+
+        session.cancel_remote_tcpip_forward(&forward).await.unwrap();
+        session.disconnect().await.unwrap();
+    }
+
     #[tokio::test]
     async fn changed_key_error_exposes_a_structured_observation() {
         let expected_key = PrivateKey::random(
@@ -871,10 +1057,12 @@ Vv9WFaQHofuFcUUAAAAaeHNzaC1ydXN0LWxpYiB0ZXN0IGZpeHR1cmUB
         .clone();
         let mut verifier = KnownHostKeyVerifier::new();
         verifier.insert_key("server.example.com", 22, &expected_key);
+        let (forwarded_tcpip_sender, _forwarded_tcpip_receiver) = tokio::sync::mpsc::channel(1);
         let mut handler = ClientHandler {
             host: "server.example.com".to_owned(),
             port: 22,
             verifier: Arc::new(verifier),
+            forwarded_tcpip_sender,
         };
 
         let error = handler.check_server_key(&presented_key).await.unwrap_err();

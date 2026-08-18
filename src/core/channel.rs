@@ -1,3 +1,4 @@
+use std::fmt;
 use std::pin::Pin;
 
 use russh::ChannelMsg;
@@ -36,6 +37,101 @@ pub struct SshChannel {
     inner: russh::Channel<russh::client::Msg>,
     context: OperationContext,
     operation_timeout: std::time::Duration,
+}
+
+/// A server-side TCP/IP forwarding request accepted by the SSH server.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SshRemoteTcpipForward {
+    address: String,
+    port: u16,
+}
+
+impl SshRemoteTcpipForward {
+    pub(crate) fn new(address: String, port: u16) -> Self {
+        Self { address, port }
+    }
+
+    /// Address on which the SSH server requested the remote listener.
+    pub fn address(&self) -> &str {
+        &self.address
+    }
+
+    /// Effective listener port. A requested port of zero is replaced by the
+    /// port selected by the SSH server.
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+}
+
+/// One incoming connection from a remote TCP/IP forward.
+pub struct SshForwardedTcpipChannel {
+    connected_address: String,
+    connected_port: u16,
+    originator_address: String,
+    originator_port: u16,
+    channel: SshChannel,
+}
+
+impl fmt::Debug for SshForwardedTcpipChannel {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SshForwardedTcpipChannel")
+            .field("connected_address", &self.connected_address)
+            .field("connected_port", &self.connected_port)
+            .field("originator_address", &self.originator_address)
+            .field("originator_port", &self.originator_port)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SshForwardedTcpipChannel {
+    pub(crate) fn new(
+        connected_address: String,
+        connected_port: u16,
+        originator_address: String,
+        originator_port: u16,
+        channel: SshChannel,
+    ) -> Self {
+        Self {
+            connected_address,
+            connected_port,
+            originator_address,
+            originator_port,
+            channel,
+        }
+    }
+
+    pub fn connected_address(&self) -> &str {
+        &self.connected_address
+    }
+
+    pub fn connected_port(&self) -> u16 {
+        self.connected_port
+    }
+
+    pub fn originator_address(&self) -> &str {
+        &self.originator_address
+    }
+
+    pub fn originator_port(&self) -> u16 {
+        self.originator_port
+    }
+
+    pub fn into_channel(self) -> SshChannel {
+        self.channel
+    }
+
+    pub fn into_stream(self) -> SshChannelStream {
+        self.channel.into_stream()
+    }
+}
+
+pub(crate) struct PendingForwardedTcpip {
+    pub(crate) channel: russh::Channel<russh::client::Msg>,
+    pub(crate) connected_address: String,
+    pub(crate) connected_port: u32,
+    pub(crate) originator_address: String,
+    pub(crate) originator_port: u32,
 }
 
 impl SshSession {
@@ -131,6 +227,117 @@ impl SshSession {
             context.clone(),
             self.config().operation_timeout,
         ))
+    }
+
+    /// Ask the SSH server to listen for remote connections.
+    ///
+    /// Use [`SshSession::next_forwarded_tcpip`] to receive each incoming
+    /// connection. Port zero asks the server to choose an available port.
+    pub async fn request_remote_tcpip_forward(
+        &mut self,
+        address: impl Into<String>,
+        port: u16,
+    ) -> Result<SshRemoteTcpipForward, SshError> {
+        let context = self
+            .base_context()
+            .with_timeout_from_now(self.config().operation_timeout);
+        self.request_remote_tcpip_forward_with_context(address, port, &context)
+            .await
+    }
+
+    /// Ask the SSH server to listen with an explicit operation context.
+    pub async fn request_remote_tcpip_forward_with_context(
+        &mut self,
+        address: impl Into<String>,
+        port: u16,
+        context: &OperationContext,
+    ) -> Result<SshRemoteTcpipForward, SshError> {
+        let address = address.into();
+        let returned_port = self
+            .request_raw_tcpip_forward_with_context(address.clone(), port, context)
+            .await?;
+        let effective_port = if returned_port == 0 {
+            port
+        } else {
+            u16::try_from(returned_port).map_err(|_| {
+                SshError::from_source(
+                    crate::ErrorKind::Protocol,
+                    format!("SSH server returned invalid forwarded port {returned_port}"),
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "forwarded port exceeds the TCP port range",
+                    ),
+                )
+            })?
+        };
+        if effective_port == 0 {
+            return Err(SshError::protocol(
+                "SSH server did not return a port for a dynamic remote forward",
+            ));
+        }
+        Ok(SshRemoteTcpipForward::new(address, effective_port))
+    }
+
+    /// Wait for the next connection accepted by a remote TCP/IP forward.
+    pub async fn next_forwarded_tcpip(&self) -> Result<Option<SshForwardedTcpipChannel>, SshError> {
+        let context = self.base_context();
+        self.next_forwarded_tcpip_with_context(&context).await
+    }
+
+    /// Wait for the next remote forwarded connection with cancellation.
+    pub async fn next_forwarded_tcpip_with_context(
+        &self,
+        context: &OperationContext,
+    ) -> Result<Option<SshForwardedTcpipChannel>, SshError> {
+        let pending = self.next_raw_forwarded_tcpip_with_context(context).await?;
+        let Some(pending) = pending else {
+            return Ok(None);
+        };
+        let connected_port = u16::try_from(pending.connected_port).map_err(|_| {
+            SshError::protocol(format!(
+                "forwarded-tcpip connected port {} is outside the TCP port range",
+                pending.connected_port
+            ))
+        })?;
+        let originator_port = u16::try_from(pending.originator_port).map_err(|_| {
+            SshError::protocol(format!(
+                "forwarded-tcpip originator port {} is outside the TCP port range",
+                pending.originator_port
+            ))
+        })?;
+        Ok(Some(SshForwardedTcpipChannel::new(
+            pending.connected_address,
+            connected_port,
+            pending.originator_address,
+            originator_port,
+            SshChannel::from_inner(
+                pending.channel,
+                self.base_context(),
+                self.config().operation_timeout,
+            ),
+        )))
+    }
+
+    /// Cancel a previously registered remote TCP/IP forward.
+    pub async fn cancel_remote_tcpip_forward(
+        &mut self,
+        forward: &SshRemoteTcpipForward,
+    ) -> Result<(), SshError> {
+        let context = self
+            .base_context()
+            .with_timeout_from_now(self.config().operation_timeout);
+        self.cancel_remote_tcpip_forward_with_context(forward, &context)
+            .await
+    }
+
+    /// Cancel a remote TCP/IP forward with an explicit operation context.
+    pub async fn cancel_remote_tcpip_forward_with_context(
+        &mut self,
+        forward: &SshRemoteTcpipForward,
+        context: &OperationContext,
+    ) -> Result<(), SshError> {
+        self.cancel_raw_tcpip_forward_with_context(forward.address.clone(), forward.port, context)
+            .await
     }
 
     /// Open a generic SSH session channel after authentication.
