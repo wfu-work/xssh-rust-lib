@@ -868,8 +868,9 @@ mod tests {
     use super::{ClientHandler, SshSession};
     use crate::{
         AuthMethod, AuthMethodKind, AuthenticationPlan, CancellationToken, ErrorKind,
-        HostKeyDecision, HostKeyVerifier, KnownHostKeyVerifier, RsaHashAlgorithm, SecretString,
-        ServerAuthMethod, Socks5Proxy, SshConfig, SshError, TofuHostKeyVerifier,
+        ForwardingAccessPolicy, ForwardingRelayOptions, ForwardingTarget, HostKeyDecision,
+        HostKeyVerifier, KnownHostKeyVerifier, RsaHashAlgorithm, SecretString, ServerAuthMethod,
+        Socks5Proxy, SshConfig, SshError, SshForwardingRelay, TofuHostKeyVerifier,
     };
 
     const TEST_RSA_PRIVATE_KEY: &str = r#"-----BEGIN OPENSSH PRIVATE KEY-----
@@ -1298,6 +1299,138 @@ Vv9WFaQHofuFcUUAAAAaeHNzaC1ydXN0LWxpYiB0ZXN0IGZpeHR1cmUB
         session.disconnect().await.unwrap();
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn forwarding_relay_round_trips_data_tracks_stats_and_cancels() {
+        let server_key = PrivateKey::random(
+            &mut russh::keys::ssh_key::rand_core::OsRng,
+            Algorithm::Ed25519,
+        )
+        .unwrap();
+        let mut server_config = server::Config::default();
+        server_config.keys.push(server_key.clone());
+        let server_config = Arc::new(server_config);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            server::run_stream(server_config, socket, DirectTcpipServer)
+                .await
+                .unwrap();
+        });
+
+        let mut verifier = KnownHostKeyVerifier::new();
+        verifier.insert_key("127.0.0.1", address.port(), server_key.public_key());
+        let mut config = SshConfig::new("127.0.0.1", "alice").unwrap();
+        config.port = address.port();
+        config.connect_timeout = Duration::from_secs(5);
+        let session = Arc::new(
+            SshSession::connect(config, verifier, AuthMethod::password("test-password"))
+                .await
+                .unwrap(),
+        );
+
+        let relay_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay = Arc::new(
+            SshForwardingRelay::from_tcp_listener(
+                Arc::clone(&session),
+                relay_listener,
+                ForwardingTarget::tcp("echo.internal", 7).unwrap(),
+                ForwardingRelayOptions {
+                    access_policy: ForwardingAccessPolicy::allow_peer_ips(["127.0.0.1"
+                        .parse()
+                        .unwrap()]),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        let relay_address = relay.local_addr().unwrap();
+        let cancellation = CancellationToken::new();
+        let relay_cancellation = cancellation.clone();
+        let relay_task = tokio::spawn({
+            let relay = Arc::clone(&relay);
+            async move { relay.run(relay_cancellation).await }
+        });
+
+        let mut client = tokio::net::TcpStream::connect(relay_address).await.unwrap();
+        client.write_all(b"hello through relay\n").await.unwrap();
+        let mut echoed = [0_u8; 20];
+        client.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, b"hello through relay\n");
+        client.shutdown().await.unwrap();
+
+        let stats = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let snapshot = relay.stats();
+                if snapshot.completed_connections == 1 {
+                    break snapshot;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(stats.accepted_connections, 1);
+        assert_eq!(stats.rejected_connections, 0);
+        assert_eq!(stats.completed_connections, 1);
+        assert_eq!(stats.failed_connections, 0);
+        assert_eq!(stats.active_connections, 0);
+        assert_eq!(stats.bytes_local_to_remote, 20);
+        assert_eq!(stats.bytes_remote_to_local, 20);
+        assert_eq!(stats.total_bytes(), 40);
+        assert!(stats.bytes_per_second() > 0.0);
+
+        let rejected_relay = Arc::new(
+            SshForwardingRelay::bind_tcp(
+                Arc::clone(&session),
+                "127.0.0.1:0",
+                ForwardingTarget::tcp("echo.internal", 7).unwrap(),
+                ForwardingRelayOptions {
+                    access_policy: ForwardingAccessPolicy::allow_peer_ips(["127.0.0.2"
+                        .parse()
+                        .unwrap()]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap(),
+        );
+        let rejected_cancellation = CancellationToken::new();
+        let rejected_relay_task = tokio::spawn({
+            let rejected_relay = Arc::clone(&rejected_relay);
+            let rejected_cancellation = rejected_cancellation.clone();
+            async move { rejected_relay.run(rejected_cancellation).await }
+        });
+        let rejected_client = tokio::net::TcpStream::connect(rejected_relay.local_addr().unwrap())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if rejected_relay.stats().rejected_connections == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(rejected_relay.stats().accepted_connections, 1);
+        drop(rejected_client);
+        rejected_cancellation.cancel();
+        assert_eq!(
+            rejected_relay_task.await.unwrap().unwrap_err().kind(),
+            ErrorKind::Cancelled
+        );
+
+        cancellation.cancel();
+        assert_eq!(
+            relay_task.await.unwrap().unwrap_err().kind(),
+            ErrorKind::Cancelled
+        );
+        session.disconnect().await.unwrap();
+    }
+
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn direct_streamlocal_channel_round_trips_data() {
@@ -1347,6 +1480,111 @@ Vv9WFaQHofuFcUUAAAAaeHNzaC1ydXN0LWxpYiB0ZXN0IGZpeHR1cmUB
         assert_eq!(&buffer[..read], b"hello through unix ssh\n");
         session.disconnect().await.unwrap();
         let _ = std::fs::remove_file(socket_path);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn unix_forwarding_relay_round_trips_data() {
+        let suffix = format!(
+            "{}-{}",
+            std::process::id(),
+            UNIX_EPOCH.elapsed().unwrap().as_nanos()
+        );
+        let target_path = format!("/tmp/xssh-rust-lib-relay-target-{suffix}.sock");
+        let listener_path = format!("/tmp/xssh-rust-lib-relay-listener-{suffix}.sock");
+        let _ = std::fs::remove_file(&target_path);
+        let _ = std::fs::remove_file(&listener_path);
+        let target_listener = tokio::net::UnixListener::bind(&target_path).unwrap();
+        tokio::spawn(async move {
+            let (socket, _) = target_listener.accept().await.unwrap();
+            let (mut reader, mut writer) = socket.into_split();
+            let _ = tokio::io::copy(&mut reader, &mut writer).await;
+        });
+
+        let server_key = PrivateKey::random(
+            &mut russh::keys::ssh_key::rand_core::OsRng,
+            Algorithm::Ed25519,
+        )
+        .unwrap();
+        let mut server_config = server::Config::default();
+        server_config.keys.push(server_key.clone());
+        let server_config = Arc::new(server_config);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            server::run_stream(server_config, socket, DirectStreamlocalServer)
+                .await
+                .unwrap();
+        });
+
+        let mut verifier = KnownHostKeyVerifier::new();
+        verifier.insert_key("127.0.0.1", address.port(), server_key.public_key());
+        let mut config = SshConfig::new("127.0.0.1", "alice").unwrap();
+        config.port = address.port();
+        config.connect_timeout = Duration::from_secs(5);
+        let session = Arc::new(
+            SshSession::connect(config, verifier, AuthMethod::password("test-password"))
+                .await
+                .unwrap(),
+        );
+
+        let relay = Arc::new(
+            SshForwardingRelay::bind_unix(
+                Arc::clone(&session),
+                &listener_path,
+                ForwardingTarget::streamlocal(&target_path).unwrap(),
+                ForwardingRelayOptions::default(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(
+            relay.local_unix_path().unwrap(),
+            std::path::Path::new(&listener_path)
+        );
+        let cancellation = CancellationToken::new();
+        let relay_task = tokio::spawn({
+            let relay = Arc::clone(&relay);
+            let cancellation = cancellation.clone();
+            async move { relay.run(cancellation).await }
+        });
+
+        let payload = b"hello through unix relay\n";
+        let mut client = tokio::net::UnixStream::connect(&listener_path)
+            .await
+            .unwrap();
+        client.write_all(payload).await.unwrap();
+        let mut echoed = vec![0_u8; payload.len()];
+        client.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(echoed, payload);
+        client.shutdown().await.unwrap();
+
+        let stats = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let snapshot = relay.stats();
+                if snapshot.completed_connections == 1 {
+                    break snapshot;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(stats.accepted_connections, 1);
+        assert_eq!(stats.completed_connections, 1);
+        assert_eq!(stats.failed_connections, 0);
+        assert_eq!(stats.bytes_local_to_remote, payload.len() as u64);
+        assert_eq!(stats.bytes_remote_to_local, payload.len() as u64);
+
+        cancellation.cancel();
+        assert_eq!(
+            relay_task.await.unwrap().unwrap_err().kind(),
+            ErrorKind::Cancelled
+        );
+        session.disconnect().await.unwrap();
+        let _ = std::fs::remove_file(target_path);
+        let _ = std::fs::remove_file(listener_path);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

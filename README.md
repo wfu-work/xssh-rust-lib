@@ -21,6 +21,8 @@ xssh-rust-lib
 - 服务器主机密钥指纹校验；
 - 连接生命周期；
 - 通用 SSH session channel、TCP/Unix socket 转发、ProxyJump 和异步字节流；
+- 统一 forwarding relay manager：本地 TCP/Unix listener、远端 TCP/Unix target、并发限制、
+  peer IP allowlist、取消和双向流量统计；
 - 可复用的 `CancellationToken`、`OperationContext` 和结构化 `SshError`。
 
 ### `terminal`
@@ -259,6 +261,58 @@ loop {
 `open_direct_tcpip_from` 或其 `_with_context` 版本。打开 channel 支持
 `OperationContext` 的截止时间和取消信号，channel stream 的 `read`、`write`、`flush`
 也会沿用同一套操作超时策略。
+
+### Forwarding relay manager
+
+如果应用需要长期运行一个本地端口映射，不必自己重复实现 accept、并发控制和双向复制，
+可以使用 `SshForwardingRelay`。它支持本地 TCP 或 Unix listener，以及 SSH 侧的
+`direct-tcpip` 或 `direct-streamlocal` target：
+
+```rust,no_run
+use std::sync::Arc;
+use std::time::Duration;
+use xssh_rust_lib::{
+    CancellationToken, ForwardingAccessPolicy, ForwardingRelayOptions, ForwardingTarget,
+    SshForwardingRelay, SshSession,
+};
+
+# async fn run(session: SshSession) -> Result<(), Box<dyn std::error::Error>> {
+let session = Arc::new(session);
+let relay = SshForwardingRelay::bind_tcp(
+    Arc::clone(&session),
+    "127.0.0.1:15432",
+    ForwardingTarget::tcp("database.internal", 5432)?,
+    ForwardingRelayOptions {
+        max_connections: 64,
+        connection_timeout: Duration::from_secs(15),
+        access_policy: ForwardingAccessPolicy::allow_peer_ips(
+            ["127.0.0.1".parse()?],
+        ),
+    },
+)
+.await?;
+
+let cancellation = CancellationToken::new();
+let relay_task = {
+    let cancellation = cancellation.clone();
+    tokio::spawn(async move { relay.run(cancellation).await })
+};
+
+// GPUI 关闭窗口或应用退出时调用；run 会返回 ErrorKind::Cancelled。
+cancellation.cancel();
+relay_task.await??;
+# session.disconnect().await?;
+# Ok(())
+# }
+```
+
+`ForwardingRelayOptions::max_connections` 使用立即拒绝策略，达到上限的新连接会被关闭并
+计入 `rejected_connections`；配置了 allowlist 时，非允许的 TCP peer 也会被拒绝，Unix
+peer 在配置 allowlist 后会被拒绝。通过 `relay.stats()` 可以读取 accepted、rejected、
+active、completed、failed，以及 local-to-remote、remote-to-local 字节数和平均吞吐量。
+每个 SSH channel 的建立受 `connection_timeout` 和传入的 `OperationContext` 约束；取消
+relay 会同时取消监听循环和进行中的 channel relay。Unix listener 的 socket 文件由调用方
+负责在生命周期结束后删除，避免基础库误删被其他进程复用的路径。
 
 远程反向转发使用 `request_remote_tcpip_forward` 注册服务端监听，再通过
 `next_forwarded_tcpip` 消费每个进入的连接。远端 channel 队列容量固定为 64，消费速度不足

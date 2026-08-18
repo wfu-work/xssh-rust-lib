@@ -13,12 +13,13 @@ pub mod sftp;
 
 pub use core::{
     Algorithm, AuthMethod, AuthMethodKind, AuthenticationAttempt, AuthenticationObservation,
-    AuthenticationPlan, CancellationToken, Certificate, ErrorContext, ErrorKind, HashAlg,
-    HostKeyDecision, HostKeyObservation, HostKeyVerifier, KeyboardInteractiveChallenge,
+    AuthenticationPlan, CancellationToken, Certificate, ErrorContext, ErrorKind,
+    ForwardingAccessPolicy, ForwardingRelayOptions, ForwardingRelayStatsSnapshot, ForwardingTarget,
+    HashAlg, HostKeyDecision, HostKeyObservation, HostKeyVerifier, KeyboardInteractiveChallenge,
     KeyboardInteractiveHandler, KeyboardInteractivePrompt, KnownHostEntry, KnownHostKeyVerifier,
     KnownHostMarker, KnownHosts, OperationContext, PrivateKey, PublicKey, RsaHashAlgorithm,
     SecretString, ServerAuthMethod, Socks5Authentication, Socks5Proxy, Socks5ProxyOptions,
     SshChannel, SshChannelEvent, SshChannelStream, SshConfig, SshError,
-    SshForwardedStreamlocalChannel, SshForwardedTcpipChannel, SshRemoteStreamlocalForward,
-    SshRemoteTcpipForward, SshSession, TofuHostKeyVerifier,
+    SshForwardedStreamlocalChannel, SshForwardedTcpipChannel, SshForwardingRelay,
+    SshRemoteStreamlocalForward, SshRemoteTcpipForward, SshSession, TofuHostKeyVerifier,
 };

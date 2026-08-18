@@ -6,6 +6,7 @@ mod config;
 mod error;
 mod host_key;
 mod operation;
+mod relay;
 mod session;
 mod socks5;
 
@@ -25,6 +26,10 @@ pub use host_key::{
     KnownHostMarker, KnownHosts, TofuHostKeyVerifier,
 };
 pub use operation::{CancellationToken, OperationContext};
+pub use relay::{
+    ForwardingAccessPolicy, ForwardingRelayOptions, ForwardingRelayStatsSnapshot, ForwardingTarget,
+    SshForwardingRelay,
+};
 pub use session::SshSession;
 pub use socks5::{Socks5Authentication, Socks5Proxy, Socks5ProxyOptions};
 
