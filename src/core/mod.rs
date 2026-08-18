@@ -8,7 +8,11 @@ mod host_key;
 mod operation;
 mod session;
 
-pub use auth::{AuthMethod, SecretString};
+pub use auth::{
+    AuthMethod, AuthMethodKind, AuthenticationAttempt, AuthenticationObservation,
+    AuthenticationPlan, KeyboardInteractiveChallenge, KeyboardInteractiveHandler,
+    KeyboardInteractivePrompt, RsaHashAlgorithm, SecretString, ServerAuthMethod,
+};
 pub use channel::{SshChannel, SshChannelEvent, SshChannelStream};
 pub use config::SshConfig;
 pub use error::{ErrorContext, ErrorKind, SshError};
@@ -20,4 +24,4 @@ pub use operation::{CancellationToken, OperationContext};
 pub use session::SshSession;
 
 /// SSH key types used by the pinned `russh` protocol implementation.
-pub use russh::keys::{Algorithm, HashAlg, PrivateKey, PublicKey};
+pub use russh::keys::{Algorithm, Certificate, HashAlg, PrivateKey, PublicKey};

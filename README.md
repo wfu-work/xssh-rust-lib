@@ -17,7 +17,7 @@ xssh-rust-lib
 ### `core`
 
 - SSH TCP 连接、握手超时、认证超时、操作超时和 keepalive；
-- 密码与私钥认证；
+- 密码、私钥、键盘交互、SSH agent 和 OpenSSH 用户证书认证；
 - 服务器主机密钥指纹校验；
 - 连接生命周期；
 - 通用 SSH session channel 和异步字节流；
@@ -163,6 +163,73 @@ session.disconnect().await?;
 # }
 ```
 
+## 认证方式与回退
+
+`SshSession::connect` 的第三个参数可以是单个 `AuthMethod`，也可以是按顺序执行的
+`AuthenticationPlan`。传入单个方法的旧代码仍然有效；计划为空会返回配置错误。每个方法
+只有在服务端拒绝、或本地方法不可用且连接仍保持打开时才会继续尝试下一个方法：
+
+```rust,no_run
+use std::path::Path;
+use xssh_rust_lib::{
+    AuthMethod, AuthenticationPlan, KnownHostKeyVerifier, PrivateKey, RsaHashAlgorithm, SshConfig,
+    SshSession,
+};
+
+# async fn run() -> Result<(), Box<dyn std::error::Error>> {
+let config = SshConfig::new("server.example.com", "alice")?;
+let verifier = KnownHostKeyVerifier::from_path("/home/alice/.ssh/known_hosts")?;
+let private_key = PrivateKey::read_openssh_file(Path::new("/home/alice/.ssh/id_rsa"))?;
+
+let auth = AuthenticationPlan::new([
+    AuthMethod::agent(),
+    AuthMethod::private_key_with_rsa_hash(
+        private_key,
+        RsaHashAlgorithm::Sha512,
+    ),
+    AuthMethod::password(std::env::var("XSSH_PASSWORD")?),
+]);
+
+let session = SshSession::connect(config, verifier, auth).await?;
+session.disconnect().await?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+# }
+```
+
+私钥认证支持口令保护的 key。RSA key 默认使用 `RsaHashAlgorithm::Auto`，优先读取
+服务端 `server-sig-algs` 扩展并选择 `rsa-sha2-512` 或 `rsa-sha2-256`；也可以显式指定
+`Sha256`、`Sha512`，或仅为兼容旧服务端而选择 `LegacySha1`。RSA 签名算法策略同样适用于
+`AuthMethod::agent_with_rsa_hash`。
+
+键盘交互适合 OTP、PAM 和多提示登录。回调在每次服务端 challenge 到达时异步执行，返回值
+必须与 prompt 数量完全一致；`echo` 字段可用于决定 GPUI 是否遮挡输入：
+
+```rust,no_run
+use xssh_rust_lib::{AuthMethod, SecretString, SshError};
+
+let auth = AuthMethod::keyboard_interactive(|challenge| async move {
+    let answers = challenge.prompts.iter().map(|prompt| {
+        // 实际应用应把 challenge 交给 GPUI，再把用户输入包装成 SecretString。
+        let answer = if prompt.echo { "user-response" } else { "otp-response" };
+        SecretString::new(answer)
+    }).collect();
+    Ok::<_, SshError>(answers)
+});
+```
+
+OpenSSH 证书通过 `AuthMethod::openssh_certificate` 或带口令的构造函数启用。库会在发送
+认证请求前检查证书是 user certificate，并确认它的公钥与私钥匹配；证书有效期、principal
+和 CA 策略仍由 SSH 服务端执行。
+
+SSH agent 在 Unix 上默认读取 `SSH_AUTH_SOCK`，也可以用 `agent_from_socket` 指定 Unix
+domain socket；Windows 默认连接 Pageant，或把 named pipe 路径传给同一构造函数。agent
+中不存在可用身份、socket/Pageant 不可用时，错误会进入认证观察结果并允许计划继续执行后续
+方法。
+
+认证失败返回的 `SshError` 提供 `authentication_observation()`，其中记录每次尝试的方法、
+服务端剩余方法、partial-success 状态和脱敏错误信息。它适合在 GPUI 状态层展示下一步动作，
+不需要解析错误字符串；密码、OTP 和 passphrase 不会出现在 `Debug` 或标准认证错误文本中。
+
 ## 使用示例
 
 ```rust,no_run
@@ -220,7 +287,7 @@ sftp.close().await?;
 
 ## 当前未包含
 
-GPUI UI、VT100 渲染、SQLite、Keychain、Windows Credential Manager、SSH agent、端口转发和代理链不属于当前基础库。
+GPUI UI、VT100 渲染、SQLite、Keychain、Windows Credential Manager、端口转发和代理链不属于当前基础库。
 
 ## 开发检查
 

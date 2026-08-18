@@ -1,6 +1,7 @@
 use std::fmt;
 use std::sync::Arc;
 
+use super::auth::AuthenticationObservation;
 use super::host_key::HostKeyObservation;
 
 /// Broad phase in which an SSH operation failed.
@@ -27,6 +28,7 @@ pub struct ErrorContext {
     port: Option<u16>,
     path: Option<String>,
     host_key_observation: Option<HostKeyObservation>,
+    authentication_observation: Option<AuthenticationObservation>,
 }
 
 impl ErrorContext {
@@ -48,6 +50,10 @@ impl ErrorContext {
 
     pub fn host_key_observation(&self) -> Option<&HostKeyObservation> {
         self.host_key_observation.as_ref()
+    }
+
+    pub fn authentication_observation(&self) -> Option<&AuthenticationObservation> {
+        self.authentication_observation.as_ref()
     }
 }
 
@@ -128,6 +134,14 @@ impl SshError {
         self
     }
 
+    pub(crate) fn with_authentication_observation(
+        mut self,
+        observation: AuthenticationObservation,
+    ) -> Self {
+        self.context.authentication_observation = Some(observation);
+        self
+    }
+
     pub fn with_retryable(mut self, retryable: bool) -> Self {
         self.retryable = retryable;
         self
@@ -165,6 +179,10 @@ impl SshError {
 
     pub fn host_key_observation(&self) -> Option<&HostKeyObservation> {
         self.context.host_key_observation()
+    }
+
+    pub fn authentication_observation(&self) -> Option<&AuthenticationObservation> {
+        self.context.authentication_observation()
     }
 
     pub fn is_retryable(&self) -> bool {

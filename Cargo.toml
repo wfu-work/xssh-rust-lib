@@ -12,7 +12,7 @@ categories = ["network-programming", "authentication", "filesystem"]
 [dependencies]
 base64ct = { version = "1.6", features = ["alloc"] }
 hmac = "0.12"
-russh = { version = "=0.54.3", default-features = false, features = ["ring"] }
+russh = { version = "=0.54.3", default-features = false, features = ["ring", "rsa"] }
 sha1 = "0.10"
 tokio = { version = "1", features = ["macros", "net", "rt", "sync", "time"] }
 zeroize = "1.8.1"
